@@ -1,0 +1,25 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
+    open-pull-requests-limit: 5
+    groups:
+      aws-sdk:
+        patterns: ['@aws-sdk/*', '@smithy/*']
+      tooling:
+        dependency-type: development
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
+    groups:
+      actions:
+        patterns: ['*']
+
+  - package-ecosystem: terraform
+    directories: ['/', '/modules/download-lambda', '/examples/*']
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 }

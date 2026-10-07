@@ -1,0 +1,246 @@
+import { invalidLabelName } from '../domain/labels.ts'
+import type { QueueKind, QueueRef } from '../domain/types.ts'
+import type {
+  Config,
+  GitHubCredentials,
+  RemoteWriteAuth,
+  RemoteWriteConfig,
+  RunnerConfig,
+} from './types.ts'
+
+/**
+ * Parses the CONFIG environment variable the Terraform module writes (JSON, snake_case).
+ *
+ * Every problem is collected and reported together, so a misconfiguration is fixed in one
+ * deploy rather than one error per cold start. The module validates its inputs too; this is the
+ * Lambda's own guard, since the variable can also be set by hand.
+ */
+
+export const CONFIG_VERSION = 1
+
+export class ConfigError extends Error {
+  override readonly name = 'ConfigError'
+  readonly problems: readonly string[]
+  constructor(problems: readonly string[]) {
+    super(`invalid CONFIG:\n  - ${problems.join('\n  - ')}`)
+    this.problems = problems
+  }
+}
+
+type Json = unknown
+
+class Reader {
+  readonly problems: string[] = []
+
+  object(value: Json, at: string): Record<string, Json> {
+    if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      return value as Record<string, Json>
+    }
+    this.problems.push(`${at} must be an object`)
+    return {}
+  }
+
+  array(value: Json, at: string): Json[] {
+    if (Array.isArray(value)) return value
+    this.problems.push(`${at} must be an array`)
+    return []
+  }
+
+  string(value: Json, at: string, pattern?: RegExp): string {
+    if (typeof value === 'string' && value.length > 0 && (!pattern || pattern.test(value))) {
+      return value
+    }
+    this.problems.push(`${at} must be a non-empty string${pattern ? ` matching ${pattern}` : ''}`)
+    return ''
+  }
+
+  optionalString(value: Json, at: string, pattern?: RegExp): string | undefined {
+    return value === undefined || value === null ? undefined : this.string(value, at, pattern)
+  }
+
+  number(value: Json, at: string, min: number, max: number): number {
+    if (typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max) {
+      return value
+    }
+    this.problems.push(`${at} must be a number from ${min} to ${max}`)
+    return min
+  }
+
+  stringMap(
+    value: Json,
+    at: string,
+    check: (key: string) => string | undefined,
+  ): Record<string, string> {
+    if (value === undefined || value === null) return {}
+    const map: Record<string, string> = {}
+    for (const [key, item] of Object.entries(this.object(value, at))) {
+      const problem = check(key)
+      if (problem) this.problems.push(`${at}.${key} ${problem}`)
+      else map[key] = this.string(item, `${at}.${key}`)
+    }
+    return map
+  }
+}
+
+const ARN_SQS = /^arn:(aws[a-z-]*):sqs:([a-z0-9-]+):(\d{12}):([A-Za-z0-9_-]{1,80})$/
+const ARN_SECRET = /^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$/
+const ARN_ROLE = /^arn:aws[a-z-]*:iam::\d{12}:role\/.+$/
+const HTTP_URL = /^https?:\/\/[^\s/]+(\/\S*)?$/
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
+const RESERVED_HEADERS = [
+  'authorization',
+  'content-encoding',
+  'content-type',
+  'content-length',
+  'host',
+  'user-agent',
+  'x-prometheus-remote-write-version',
+]
+
+/** SQS endpoints by partition; the URL is derived from the ARN so the config stays small. */
+const DNS_SUFFIX: Record<string, string> = {
+  aws: 'amazonaws.com',
+  'aws-us-gov': 'amazonaws.com',
+  'aws-cn': 'amazonaws.com.cn',
+}
+
+export function queueFromArn(arn: string): QueueRef | string {
+  const match = arn.match(ARN_SQS)
+  if (!match) return `${arn} is not an SQS queue ARN`
+  const [, partition = '', region = '', account = '', name = ''] = match
+  const suffix = DNS_SUFFIX[partition]
+  if (!suffix) return `${arn} is in partition ${partition}, which is not supported`
+  const kind: QueueKind = name.endsWith('_dead_letter') ? 'dead_letter' : 'main'
+  return { arn, name, url: `https://sqs.${region}.${suffix}/${account}/${name}`, kind }
+}
+
+function runnerConfig(r: Reader, value: Json, at: string): RunnerConfig {
+  const o = r.object(value, at)
+  const queues: QueueRef[] = []
+  for (const [i, arn] of r.array(o.queue_arns, `${at}.queue_arns`).entries()) {
+    const queue = queueFromArn(r.string(arn, `${at}.queue_arns[${i}]`))
+    if (typeof queue === 'string') r.problems.push(`${at}.queue_arns[${i}]: ${queue}`)
+    else queues.push(queue)
+  }
+  const max = o.max_runners
+  return {
+    name: r.string(o.name, `${at}.name`, /^[A-Za-z0-9_.-]+$/),
+    environment: r.string(o.environment, `${at}.environment`, /^[A-Za-z0-9_-]+$/),
+    maxRunners:
+      max === null || max === undefined || max === -1
+        ? null
+        : r.number(max, `${at}.max_runners`, 0, 100_000),
+    runnerNamePrefix: typeof o.runner_name_prefix === 'string' ? o.runner_name_prefix : '',
+    githubApiUrl: r
+      .string(o.github_api_url ?? 'https://api.github.com', `${at}.github_api_url`, HTTP_URL)
+      .replace(/\/+$/, ''),
+    queues,
+    labels: r.stringMap(o.labels, `${at}.labels`, invalidLabelName),
+  }
+}
+
+function githubCredentials(r: Reader, value: Json, at: string): GitHubCredentials {
+  const o = r.object(value ?? { type: 'none' }, at)
+  switch (o.type) {
+    case 'none':
+      return { type: 'none' }
+    case 'secret':
+      return { type: 'secret', secretArn: r.string(o.secret_arn, `${at}.secret_arn`, ARN_SECRET) }
+    case 'ssm':
+      return {
+        type: 'ssm',
+        appIdParameter: r.string(o.app_id_parameter, `${at}.app_id_parameter`),
+        privateKeyParameter: r.string(o.private_key_parameter, `${at}.private_key_parameter`),
+      }
+    default:
+      r.problems.push(`${at}.type must be one of none, secret, ssm`)
+      return { type: 'none' }
+  }
+}
+
+function remoteWriteAuth(r: Reader, value: Json, at: string): RemoteWriteAuth {
+  const o = r.object(value ?? { type: 'none' }, at)
+  switch (o.type) {
+    case 'none':
+      return { type: 'none' }
+    case 'sigv4': {
+      const roleArn = r.optionalString(o.role_arn, `${at}.role_arn`, ARN_ROLE)
+      const externalId = r.optionalString(o.external_id, `${at}.external_id`)
+      if (externalId && !roleArn) r.problems.push(`${at}.external_id needs role_arn`)
+      return {
+        type: 'sigv4',
+        region: r.string(o.region, `${at}.region`, /^[a-z0-9-]+$/),
+        service: r.string(o.service ?? 'aps', `${at}.service`),
+        roleArn,
+        externalId,
+      }
+    }
+    case 'basic':
+    case 'bearer':
+      return { type: o.type, secretArn: r.string(o.secret_arn, `${at}.secret_arn`, ARN_SECRET) }
+    default:
+      r.problems.push(`${at}.type must be one of none, sigv4, basic, bearer`)
+      return { type: 'none' }
+  }
+}
+
+function remoteWrite(r: Reader, value: Json, at: string): RemoteWriteConfig {
+  const o = r.object(value, at)
+  return {
+    url: r.string(o.url, `${at}.url`, HTTP_URL),
+    auth: remoteWriteAuth(r, o.auth, `${at}.auth`),
+    headers: r.stringMap(o.headers, `${at}.headers`, name =>
+      !HEADER_NAME.test(name)
+        ? 'is not a valid header name'
+        : RESERVED_HEADERS.includes(name.toLowerCase())
+          ? 'is set by the remote-write client and cannot be overridden'
+          : undefined,
+    ),
+    timeoutMs: r.number(o.timeout_seconds ?? 10, `${at}.timeout_seconds`, 1, 60) * 1000,
+  }
+}
+
+export function parseConfig(raw: string | undefined): Config {
+  const r = new Reader()
+  let json: Json
+  try {
+    json = JSON.parse(raw ?? '')
+  } catch {
+    throw new ConfigError(['CONFIG must be set to the JSON the Terraform module generates'])
+  }
+  const o = r.object(json, 'CONFIG')
+  if (o.version !== CONFIG_VERSION) {
+    r.problems.push(
+      `CONFIG.version must be ${CONFIG_VERSION} (this Lambda reads version ${CONFIG_VERSION})`,
+    )
+  }
+  const runnerConfigs = r
+    .array(o.runner_configs, 'runner_configs')
+    .map((item, i) => runnerConfig(r, item, `runner_configs[${i}]`))
+  if (runnerConfigs.length === 0)
+    r.problems.push('runner_configs must list at least one runner config')
+  for (const key of ['name', 'environment'] as const) {
+    const seen = runnerConfigs.map(c => c[key])
+    const duplicate = seen.find((v, i) => v && seen.indexOf(v) !== i)
+    if (duplicate) r.problems.push(`runner_configs: ${key} "${duplicate}" appears more than once`)
+  }
+  const github = r.object(o.github ?? {}, 'github')
+  const config: Config = {
+    runnerConfigs,
+    github: {
+      credentials: githubCredentials(r, github.credentials, 'github.credentials'),
+      owners: r
+        .array(github.owners ?? [], 'github.owners')
+        .map((owner, i) =>
+          r.string(owner, `github.owners[${i}]`, /^[A-Za-z0-9_.-]+(\/[A-Za-z0-9_.-]+)?$/),
+        ),
+    },
+    remoteWrite: remoteWrite(r, o.remote_write, 'remote_write'),
+    labels: r.stringMap(o.labels, 'labels', invalidLabelName),
+    bootGraceSeconds: r.number(o.boot_grace_seconds ?? 30, 'boot_grace_seconds', 0, 3600),
+    sourceTimeoutMs:
+      r.number(o.source_timeout_seconds ?? 10, 'source_timeout_seconds', 1, 60) * 1000,
+  }
+  if (r.problems.length > 0) throw new ConfigError(r.problems)
+  return config
+}
