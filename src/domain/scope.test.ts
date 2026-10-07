@@ -24,6 +24,14 @@ describe('scopeFromTags', () => {
     })
   })
 
+  it('reads a name in any case as the same scope', () => {
+    assert.deepEqual(scopeFromTags('Org', 'ACME', API), scopeFromTags('Org', 'acme', API))
+    assert.deepEqual(
+      scopeFromTags('Repo', 'Acme/Widgets', API),
+      scopeFromTags('Repo', 'acme/widgets', API),
+    )
+  })
+
   it('refuses tags it cannot interpret', () => {
     assert.equal(scopeFromTags(undefined, 'acme', API), undefined)
     assert.equal(scopeFromTags('Org', undefined, API), undefined)

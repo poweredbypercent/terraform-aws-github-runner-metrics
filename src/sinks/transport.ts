@@ -25,20 +25,18 @@ export class PushError extends Error {
 /**
  * Only a 400's body is kept: it says which samples were rejected and why ("out of order sample").
  * Any other body may be a proxy's page echoing the request, Authorization header included, so it
- * is not logged - and in case a 400 page echoes it too, anything shaped like a credential is
- * redacted from that one.
+ * is not logged - and a 400 body that mentions anything credential-like is withheld whole:
+ * echoed headers come in too many shapes (JSON, Go maps, raw lines) to redact reliably, and the
+ * receivers' own rejection messages never use these words.
  */
-const CREDENTIAL =
-  /\b(authorization|x-amz-security-token|x-amz-signature|signature|bearer|basic)\b\s*[:=]?\s*(?:(?:bearer|basic|aws4-hmac-sha256)\s+)?\S+/gi
+const MENTIONS_CREDENTIALS =
+  /authorization|x-amz-|signature|credential|bearer|basic |token|password|secret/i
 
 async function explain(response: Response): Promise<string> {
   if (response.status !== 400) return ''
-  const body = await response.text().catch(() => '')
-  return ` ${body
-    .replace(/[^\x20-\x7e]+/g, ' ')
-    .replace(CREDENTIAL, '$1 [redacted]')
-    .trim()
-    .slice(0, 300)}`.trimEnd()
+  const body = (await response.text().catch(() => '')).replace(/[^\x20-\x7e]+/g, ' ').trim()
+  if (MENTIONS_CREDENTIALS.test(body)) return ' (body withheld: it may echo credentials)'
+  return ` ${body.slice(0, 300)}`.trimEnd()
 }
 
 export async function post(

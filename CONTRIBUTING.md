@@ -47,7 +47,9 @@ These are settings, not files, so they are listed here for whoever administers t
   than whoever pushes tags), "Prevent self-review" on, and deployment limited to tags matching
   `v*`. The publish job waits on it.
 - **A release GitHub App**, owned by the organisation, installed on this repository only, with
-  Repository permission **Contents: Read and write** and nothing else. Store its client id and a
+  Repository permissions **Contents: Read and write** and **Workflows: Read and write** (moving
+  `v1` past a release that changed `.github/workflows` counts as a workflow update) and nothing
+  else. Store its client id and a
   private key as the secrets `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY` of the
   `release` environment (not of the repository), so they exist only for an approved release. The
   publish job moves the floating `vX` and `vX.Y` tags with its token.

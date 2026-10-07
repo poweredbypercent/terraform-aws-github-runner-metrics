@@ -222,6 +222,14 @@ describe('queueFromArn', () => {
     assert.deepEqual([main.value.kind, dlq.value.kind], ['main', 'dead_letter'])
   })
 
+  it('accepts the longest names SQS allows, and no longer', () => {
+    const arn = (name: string) => `arn:aws:sqs:eu-west-1:123456789012:${name}`
+    assert.ok(queueFromArn(arn('q'.repeat(80))).ok)
+    assert.ok(queueFromArn(arn(`${'q'.repeat(75)}.fifo`)).ok)
+    assert.ok(!queueFromArn(arn('q'.repeat(81))).ok)
+    assert.ok(!queueFromArn(arn(`${'q'.repeat(76)}.fifo`)).ok)
+  })
+
   it('refuses partitions it has no endpoint for', () => {
     const queue = queueFromArn('arn:aws-iso:sqs:us-iso-east-1:123456789012:q')
     assert.ok(!queue.ok)

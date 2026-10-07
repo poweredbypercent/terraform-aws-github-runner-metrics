@@ -195,6 +195,8 @@ time() - max(github_aws_runners_last_sample_timestamp_seconds) > 300
 - Lambda environment variables are limited to 4 KB: around a dozen runner configs per module
   instance.
 - One region per module instance: the queues must be in the region it is deployed in.
+- A multi-runner config with a FIFO build queue (`enable_fifo_build_queue`): its queue names are
+  derived without `.fifo`, so describe it in `runner_configs` with its `queue_arns`.
 - `github_app.source = "runner_ssm"` reads one App; with the runner module's several-App rotation
   (v7.11), the first.
 

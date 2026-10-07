@@ -125,6 +125,8 @@ jobs:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
+          # Moving v1 across releases that changed .github/workflows is a workflow update to GitHub.
+          permission-workflows: write
       - name: Move the floating tags
         if: ${{ !contains(github.ref_name, '-') }}
         env:

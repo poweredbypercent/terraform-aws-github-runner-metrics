@@ -18,9 +18,12 @@ export function scopeFromTags(
   apiUrl: string,
 ): GitHubScope | undefined {
   if (!owner) return undefined
-  if (type === 'Org') return ACCOUNT.test(owner) ? { type: 'org', owner, apiUrl } : undefined
+  // GitHub names are case-insensitive: one scope, one key and one label set, whatever the tag's
+  // case, so a retagged ACME cannot count acme's runners a second time.
+  const name = owner.toLowerCase()
+  if (type === 'Org') return ACCOUNT.test(name) ? { type: 'org', owner: name, apiUrl } : undefined
   if (type === 'Repo') {
-    const [account = '', repo = '', ...rest] = owner.split('/')
+    const [account = '', repo = '', ...rest] = name.split('/')
     if (rest.length > 0 || !ACCOUNT.test(account) || !REPOSITORY.test(repo)) return undefined
     return { type: 'repo', owner: account, repo, apiUrl }
   }

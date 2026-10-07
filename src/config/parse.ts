@@ -83,8 +83,9 @@ class Reader {
   }
 }
 
-/** Standard or FIFO (`.fifo`) queues. */
-const ARN_SQS = /^arn:(aws[a-z-]*):sqs:([a-z0-9-]+):(\d{12}):([A-Za-z0-9_-]{1,75}(?:\.fifo)?)$/
+/** Standard queues (up to 80 characters) or FIFO queues (the same, `.fifo` included). */
+const ARN_SQS =
+  /^arn:(aws[a-z-]*):sqs:([a-z0-9-]+):(\d{12}):([A-Za-z0-9_-]{1,80}|[A-Za-z0-9_-]{1,75}\.fifo)$/
 /** One secret, never a wildcard: the role's grant is scoped to exactly what is named here. */
 const ARN_SECRET = /^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:[A-Za-z0-9/_+=.@-]+$/
 const ARN_ROLE = /^arn:aws[a-z-]*:iam::\d{12}:role\/[A-Za-z0-9/_+=,.@-]+$/
