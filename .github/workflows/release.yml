@@ -1,8 +1,9 @@
 name: Release
 
 # Pushing a tag vX.Y.Z (matching package.json's version, on main) builds the Lambda zip, attests
-# its build provenance, and publishes a GitHub release with the zip and its SHA-256. Floating tags
-# vX and vX.Y are then moved to it; pin vX.Y.Z for an exact, verifiable version.
+# its build provenance, and publishes a GitHub release with the zip and its SHA-256. There are no
+# floating vX / vX.Y tags: consumers pin vX.Y.Z, and the workflow never writes a tag, so the
+# built-in token is enough and the tag ruleset needs no bypass for automation.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+', 'v[0-9]+.[0-9]+.[0-9]+-*']
@@ -114,38 +115,3 @@ jobs:
           # moment it appears (and works with immutable releases).
           gh release create "${TAG}" --draft --verify-tag --title "${TAG}" --notes-file notes.md ${prerelease} assets/*
           gh release edit "${TAG}" --draft=false
-      # The tag ruleset lets only the release App move tags (CONTRIBUTING.md): a bypass for GitHub
-      # Actions would let any workflow's token move v1. Its credentials are secrets of the
-      # protected `release` environment, so they are only available once a reviewer approves.
-      - name: Release App token
-        if: ${{ !contains(github.ref_name, '-') }}
-        id: release-app
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
-          # Moving v1 across releases that changed .github/workflows is a workflow update to GitHub.
-          permission-workflows: write
-      - name: Move the floating tags
-        if: ${{ !contains(github.ref_name, '-') }}
-        env:
-          APP_TOKEN: ${{ steps.release-app.outputs.token }}
-        run: |
-          version="${TAG#v}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          auth="$(printf 'x-access-token:%s' "${APP_TOKEN}" | base64 -w0)"
-          echo "::add-mask::${auth}"
-          git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic ${auth}"
-          releases="$(git ls-remote --tags --refs origin 'v*' | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$')"
-          for floating in "v${version%%.*}" "v${version%.*}"; do
-            # Forward only: a backport (v1.1.6 after v1.2.0) leaves v1 where it is.
-            latest="$(grep -F "${floating}." <<<"${releases}" | sort -V | tail -n 1)"
-            if [ "${latest}" != "${TAG}" ]; then
-              echo "${floating} stays on ${latest}, the newest ${floating}.x release"
-              continue
-            fi
-            git tag --force --annotate "${floating}" --message "${TAG}" "${GITHUB_SHA}"
-            git push --force origin "refs/tags/${floating}"
-          done

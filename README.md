@@ -105,7 +105,7 @@ gh attestation verify terraform-aws-github-runner-metrics.zip \
   --source-ref refs/tags/<vX.Y.Z> --deny-self-hosted-runners
 ```
 
-Pin an exact `vX.Y.Z`: the `vX` and `vX.Y` tags move.
+Releases are exact `vX.Y.Z` tags only; there are no floating `vX` tags to pin by mistake.
 
 ### GitHub access
 
