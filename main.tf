@@ -1,7 +1,7 @@
 # The GitHub App's credentials, created empty: the private key never passes through Terraform or
 # its state. Fill it once the App exists (see the README):
 #   aws secretsmanager put-secret-value --secret-id <name> --secret-string file://github-app.json
-# The Lambda reads it within ten minutes; until then it samples everything but GitHub.
+# The Lambda reads it at the next sample; until then it samples everything but GitHub.
 resource "aws_secretsmanager_secret" "github_app" {
   count                   = var.github_app.source == "create_secret" ? 1 : 0
   name                    = "${var.name_prefix}/github-app"

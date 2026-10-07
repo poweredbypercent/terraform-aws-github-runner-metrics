@@ -62,9 +62,7 @@ export async function readQueueDepths(
 
 const isNonExistentQueue = (error: unknown): boolean =>
   error instanceof Error &&
-  /NonExistentQueue|QueueDoesNotExist/.test(
-    `${error.name} ${(error as { Code?: string }).Code ?? ''} ${error.message}`,
-  )
+  /NonExistentQueue|QueueDoesNotExist/.test(`${error.name} ${error.message}`)
 
 /**
  * The oldest message's age per queue, from CloudWatch: SQS publishes it each minute, about a

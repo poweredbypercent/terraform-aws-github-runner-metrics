@@ -5,7 +5,7 @@ import { cached } from '../../cache.ts'
 import { scopeKey } from '../../domain/scope.ts'
 import type { GitHubScope } from '../../domain/types.ts'
 import type { Fetch } from '../../http.ts'
-import { NOW, ORG, signal } from '../../test/fixtures.ts'
+import { cachedForTest, NOW, ORG, signal } from '../../test/fixtures.ts'
 import { createGitHubAppClient, type GitHubAppClient } from './client.ts'
 import {
   type AppCredentials,
@@ -220,24 +220,25 @@ describe('readRegisteredRunners', () => {
       [RUNNERS]: [full, [{ name: 'last', status: 'offline', busy: false }]],
     })
     const client = createGitHubAppClient({
-      credentials: cached(
-        async () => APP,
-        60_000,
-        () => NOW,
-      ),
+      credentials: cachedForTest(() => APP),
       fetch: github.fetchImpl,
       userAgent: 'test',
       now: () => NOW,
     })
     const missing: GitHubScope = { type: 'org', owner: 'nope', apiUrl: 'https://api.github.com' }
     github.refuse('/orgs/nope/installation', 404)
-    const result = await readRegisteredRunners(client, [ORG, ORG, missing], [], signal)
+    const result = await readRegisteredRunners(
+      client,
+      [ORG, ORG, missing],
+      ['acme', 'nope'],
+      signal,
+    )
     assert.equal(result.values.get(scopeKey(ORG))?.length, 101)
     assert.equal(result.values.get(scopeKey(ORG))?.[100]?.status, 'offline')
     assert.deepEqual(result.failed, [scopeKey(missing)])
   })
 
-  it('queries only the allowed owners when an allowlist is set', async () => {
+  it('queries only the allowed owners, whatever their case in the tags', async () => {
     const asked: GitHubScope[] = []
     const client: GitHubAppClient = {
       get: async scope => {
@@ -245,8 +246,10 @@ describe('readRegisteredRunners', () => {
         return { runners: [] }
       },
     }
-    const result = await readRegisteredRunners(client, [ORG, REPO], ['acme/widgets'], signal)
-    assert.deepEqual([...result.values.keys()], [scopeKey(REPO)])
-    assert.deepEqual(asked, [REPO])
+    const tagged: GitHubScope = { ...REPO, owner: 'Acme', repo: 'Widgets' }
+    const result = await readRegisteredRunners(client, [ORG, tagged], ['acme/widgets'], signal)
+    assert.deepEqual([...result.values.keys()], [scopeKey(tagged)])
+    assert.deepEqual(asked, [tagged])
+    assert.deepEqual((await readRegisteredRunners(client, [ORG], [], signal)).values.size, 0)
   })
 })

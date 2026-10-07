@@ -44,6 +44,21 @@ describe('post', () => {
     }
   })
 
+  it('redacts anything shaped like a credential from a 400 body', async () => {
+    const fetchImpl: Fetch = async () =>
+      new Response(
+        'bad request; echoed Authorization: Bearer s3cr3t and x-amz-security-token=t0k',
+        {
+          status: 400,
+        },
+      )
+    await assert.rejects(post(fetchImpl, request, 1), (err: Error) => {
+      assert.doesNotMatch(err.message, /s3cr3t|t0k/)
+      assert.match(err.message, /^remote_write: 400 bad request/)
+      return true
+    })
+  })
+
   it('does not retry a 429 either: the next sample is the retry', async () => {
     const { calls, fetchImpl } = respond(429)
     await assert.rejects(post(fetchImpl, request, 1), /429/)

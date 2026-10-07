@@ -1,7 +1,7 @@
 import type { Config } from './config/types.ts'
 import { err, type Result } from './domain/result.ts'
 import { settle } from './domain/settle.ts'
-import type { RunnerInstance, Snapshot, SourceName } from './domain/types.ts'
+import type { RunnerInstance, Snapshot, SourceHealth, SourceName } from './domain/types.ts'
 import type { Logger } from './log.ts'
 import { METRICS, type Sample, sample } from './model/catalogue.ts'
 import { buildSeries } from './model/series.ts'
@@ -26,9 +26,6 @@ export interface Deps {
   readonly log: Logger
 }
 
-/** Which sources answered; a source that is not configured is absent. */
-export type SourceHealth = { readonly [S in SourceName]?: boolean }
-
 export interface Outcome {
   readonly series: number
   readonly up: SourceHealth
@@ -45,9 +42,6 @@ export async function sampleOnce(deps: Deps): Promise<Outcome> {
   return { series: series.length, up }
 }
 
-/** GitHub's answer: skipped when the App is not filled in yet, otherwise read or failed. */
-type GitHubRead = 'not-configured' | Result<RegisteredRunners>
-
 async function readSources(
   deps: Deps,
   now: number,
@@ -56,11 +50,11 @@ async function readSources(
   const budget = deps.config.sourceTimeoutMs
 
   const instances = settle(budget, signal => sources.instances(signal))
-  const [depths, ages, known, github] = await Promise.all([
+  const [depths, ages, known, runners] = await Promise.all([
     settle(budget, signal => sources.queueDepths(signal)),
     settle(budget, signal => sources.queueAges(now, signal)),
     instances,
-    sources.github ? readGitHub(sources.github, instances, budget) : undefined,
+    sources.github ? readGitHub(sources.github, instances, budget, log) : undefined,
   ])
 
   const up: { [S in SourceName]?: boolean } = {
@@ -68,7 +62,6 @@ async function readSources(
     cloudwatch: ages.ok,
     ec2: known.ok,
   }
-  const runners = github === 'not-configured' ? undefined : github
   if (runners) up.github = runners.ok && runners.value.failed.length === 0
 
   for (const [source, result] of [
@@ -85,9 +78,6 @@ async function readSources(
   if (runners?.ok && runners.value.failed.length > 0) {
     log('warn', 'GitHub scopes not read', { scopes: runners.value.failed })
   }
-  if (github === 'not-configured') {
-    log('warn', 'GitHub skipped: the App credentials have not been filled in yet')
-  }
 
   return {
     snapshot: {
@@ -101,14 +91,19 @@ async function readSources(
   }
 }
 
+/** GitHub's answer, or undefined when it is skipped: the App's credentials are not filled in. */
 async function readGitHub(
   github: GitHubSource,
   instances: Promise<Result<readonly RunnerInstance[]>>,
   budget: number,
-): Promise<GitHubRead> {
+  log: Logger,
+): Promise<Result<RegisteredRunners> | undefined> {
   const configured = await settle(budget, signal => github.isConfigured(signal))
   if (!configured.ok) return err(configured.error)
-  if (!configured.value) return 'not-configured'
+  if (!configured.value) {
+    log('warn', 'GitHub skipped: the App credentials have not been filled in yet')
+    return undefined
+  }
   const known = await instances
   // Without the instances there is nothing to ask about; reading no scopes would look like a
   // healthy GitHub reporting no runners at all.

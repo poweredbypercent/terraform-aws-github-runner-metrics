@@ -47,9 +47,15 @@ variable "repository" {
 }
 
 variable "output_dir" {
-  description = "Where to put the zip. Defaults to a directory beside this module."
+  description = "Where to put the zip. Defaults to a directory beside this module (inside .terraform/modules when the module is fetched, so a fresh init downloads it again)."
   type        = string
   default     = null
+
+  validation {
+    # The path is printed back as JSON by the script; keep it plain.
+    condition     = var.output_dir == null || can(regex("^[^\"\\\\[:cntrl:]]+$", var.output_dir))
+    error_message = "output_dir must not contain quotes, backslashes or control characters."
+  }
 }
 
 locals {

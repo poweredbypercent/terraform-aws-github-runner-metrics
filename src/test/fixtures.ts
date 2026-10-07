@@ -1,3 +1,4 @@
+import { type Cached, cached } from '../cache.ts'
 import { parseConfig } from '../config/parse.ts'
 import type { Config } from '../config/types.ts'
 import type { GitHubScope } from '../domain/types.ts'
@@ -8,6 +9,14 @@ export const NOW = Date.parse('2026-10-07T12:00:00Z')
 export const queueArn = (name: string): string => `arn:aws:sqs:eu-west-1:123456789012:${name}`
 export const ORG: GitHubScope = { type: 'org', owner: 'acme', apiUrl: 'https://api.github.com' }
 export const signal = new AbortController().signal
+
+/** A cache over `read`, on a clock that never moves: only invalidate() makes it read again. */
+export const cachedForTest = <T>(read: () => T | undefined): Cached<T> =>
+  cached(
+    async () => read(),
+    60_000,
+    () => 0,
+  )
 
 /** A parsed config with one runner config ("ci"), overridable field by field (snake_case). */
 export function testConfig(overrides: Record<string, unknown> = {}): Config {

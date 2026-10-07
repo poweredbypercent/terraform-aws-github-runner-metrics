@@ -6,6 +6,8 @@ export interface AppCredentials {
   readonly privateKey: string
 }
 
+const APP_ID = /^\d+$/
+
 /** The dedicated App's secret: {"app_id": "...", "private_key": "-----BEGIN ... KEY-----..."}. */
 export function parseAppSecret(raw: string): AppCredentials {
   let parsed: unknown
@@ -18,7 +20,7 @@ export function parseAppSecret(raw: string): AppCredentials {
   const appId = typeof app_id === 'number' ? String(app_id) : app_id
   if (
     typeof appId !== 'string' ||
-    !/^\d+$/.test(appId) ||
+    !APP_ID.test(appId) ||
     typeof private_key !== 'string' ||
     !private_key.includes('PRIVATE KEY')
   ) {
@@ -30,7 +32,7 @@ export function parseAppSecret(raw: string): AppCredentials {
 /** The runner module stores its App's key base64-encoded in SSM (github_app.key_base64). */
 export function credentialsFromRunnerModule(appId: string, keyBase64: string): AppCredentials {
   const privateKey = Buffer.from(keyBase64.trim(), 'base64').toString('utf8')
-  if (!/^\d+$/.test(appId.trim()) || !privateKey.includes('PRIVATE KEY')) {
+  if (!APP_ID.test(appId.trim()) || !privateKey.includes('PRIVATE KEY')) {
     throw new Error(
       'the runner module GitHub App parameters do not hold an app id and a base64 PEM key',
     )

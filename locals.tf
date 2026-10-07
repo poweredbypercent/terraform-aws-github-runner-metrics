@@ -19,7 +19,7 @@ locals {
   # Every runner config's scale-up Lambda carries its settings as environment variables
   # (ENVIRONMENT, RUNNERS_MAXIMUM_COUNT, RUNNER_NAME_PREFIX, GHES_URL, the App's SSM parameter
   # names), in both module variants: the one place to read them without copying anything.
-  stack_variables = merge(concat([{}], [
+  stack_runner_configs = [
     for index, stack in var.runner_stacks : (
       stack.multi_runner != null
       ? {
@@ -40,7 +40,11 @@ locals {
         }
       }
     )
-  ])...)
+  ]
+  # merge() keeps the last of a repeated name; checks.tf reports one rather than letting a stack
+  # vanish.
+  stack_variables    = merge(concat([{}], local.stack_runner_configs)...)
+  stack_config_names = flatten([for configs in local.stack_runner_configs : keys(configs)])
 
   # Both sources of runner configs in one shape; everything after this is shared, so the two
   # cannot drift apart. A null github_api_url or queue_arns is filled in below.
@@ -148,6 +152,17 @@ locals {
     { type = "none" }
   )
   remote_write_secret_arn = try(local.remote_write_auth.secret_arn, null)
+
+  # ---------------------------------------------------------------------------------------------
+  # What the role may read (iam.tf)
+  # ---------------------------------------------------------------------------------------------
+
+  secret_arns = compact([local.github_secret_arn, local.remote_write_secret_arn])
+  ssm_parameter_arns = local.github_ssm_parameters == null ? [] : [
+    for name in compact(values(local.github_ssm_parameters)) :
+    "arn:${local.partition}:ssm:${local.region}:${local.account}:parameter/${trimprefix(name, "/")}"
+  ]
+  kms_key_arns = distinct(compact(concat([var.kms_key_arn], var.secrets_kms_key_arns)))
 
   # ---------------------------------------------------------------------------------------------
   # The Lambda's configuration: one JSON document, read by src/config/parse.ts

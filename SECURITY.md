@@ -20,8 +20,8 @@ The Lambda code, the Terraform modules, and the release pipeline that builds and
 - The function's IAM policy is generated from the features in use; read-only except for writing its
   own logs and, when configured, assuming a Prometheus writer role.
 - The organisations and repositories queried come from runner instance tags, which a job may be
-  able to set on its own instance: they are validated and encoded before use, and `owners` limits
-  them to an allowlist (recommended).
+  able to set on its own instance: they are validated and encoded before use, and only those in
+  the required `owners` allowlist are queried.
 - Credentials are sent over https only, and never in a URL; secret ARNs must name one secret.
 - Logs carry error messages and HTTP statuses, never request headers, tokens or secrets. A
   remote-write response body is logged only for a 400, which explains rejected samples.

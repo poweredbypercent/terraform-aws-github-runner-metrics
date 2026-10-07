@@ -124,13 +124,13 @@ dedicated, read-only one:
    rm github-app.json
    ```
 
-The Lambda picks it up within ten minutes. Until then it reports everything except the GitHub
-series. The private key never passes through Terraform or its state. Each installation token is
-narrowed to the one permission listing runners needs.
+The Lambda picks it up at the next sample (a later change to it, within ten minutes). Until then
+it reports everything except the GitHub series. The private key never passes through Terraform or
+its state. Each installation token is narrowed to the one permission listing runners needs.
 
-Set `github_app.owners` to the organisations (or `owner/repo` targets) your runners register in.
-Without it, every one named by the instances' `ghr:Owner` tag is queried - and a job that can tag
-its own instance could then point the App at another organisation it is installed on.
+`github_app.owners` is required: the organisations (or `owner/repo` targets) your runners register
+in. Only those are queried, whatever the instances' `ghr:Owner` tags say, so a job that can tag its
+own instance cannot point the App at another organisation it is installed on.
 
 Other options (`github_app.source`): a secret you manage (`existing_secret`), the runner module's
 own App from its SSM parameters (`runner_ssm` - it works, but that App can register runners, so it
@@ -190,8 +190,8 @@ time() - max(github_aws_runners_last_sample_timestamp_seconds) > 300
   scale-up hit an unexpected error is removed from the queue by the runner module.
 - With `enable_job_queued_check` off, a job an idle pool runner took still launches an instance:
   booting counts instances, so it can overstate demand briefly.
-- The GitHub App must be installed on every organisation or repository the instances register in;
-  `owners` limits which are queried.
+- The GitHub App must be installed on every organisation or repository in `owners`; runners
+  registering anywhere else are not counted, and booting is not reported for their runner config.
 - Lambda environment variables are limited to 4 KB: around a dozen runner configs per module
   instance.
 - One region per module instance: the queues must be in the region it is deployed in.
@@ -270,7 +270,7 @@ No modules.
 | remote\_write | The Prometheus remote\_write endpoint, and how to authenticate to it. At most one of:<br/><br/>  sigv4    Amazon Managed Service for Prometheus. role\_arn: a writer role to assume (for a<br/>           workspace in another account); without it the Lambda's own role signs, and needs<br/>           aps:RemoteWrite (see additional\_policy\_json).<br/>  basic    a Secrets Manager secret with {"username": "...", "password": "..."} (Grafana Cloud).<br/>  bearer   a Secrets Manager secret with {"token": "..."} or the bare token.<br/><br/>headers: plain, non-secret extras such as X-Scope-OrgID for Mimir; they are visible in the<br/>function's configuration, so never put credentials there. | <pre>object({<br/>    url = string<br/>    auth = optional(object({<br/>      sigv4 = optional(object({<br/>        region      = optional(string)<br/>        service     = optional(string, "aps")<br/>        role_arn    = optional(string)<br/>        external_id = optional(string)<br/>      }))<br/>      basic  = optional(object({ secret_arn = string }))<br/>      bearer = optional(object({ secret_arn = string }))<br/>    }), {})<br/>    headers         = optional(map(string), {})<br/>    timeout_seconds = optional(number, 10)<br/>  })</pre> | n/a | yes |
 | additional\_policy\_json | Extra IAM policy for the function's role, for example aps:RemoteWrite on a same-account workspace when no sigv4.role\_arn is used. | `string` | `null` | no |
 | boot\_grace\_seconds | Instances younger than this are not counted as booting: they are always unregistered. | `number` | `30` | no |
-| github\_app | Where the GitHub App credentials that read registered runners (busy, idle, offline, booting)<br/>come from:<br/><br/>  create\_secret     (default) the module creates an empty Secrets Manager secret; put<br/>                    {"app\_id": "...", "private\_key": "<PEM>"} in it. Until then GitHub is skipped.<br/>  existing\_secret   a secret you manage, same JSON, in secret\_arn.<br/>  runner\_ssm        the runner module's own App, from its SSM parameters. Works, but that App<br/>                    can register runners: more access than reading them needs.<br/>  disabled          no GitHub: queue, instance and capacity metrics only.<br/><br/>The recommended App is dedicated and read-only: organisation "Self-hosted runners: Read", plus<br/>repository "Administration: Read" for repository-level runners.<br/><br/>owners: the organisations or "owner/repo" targets to query. Set it: by default every one the<br/>runner instances' ghr:Owner tags name is queried, and a job that can tag its own instance can<br/>then point the App at another organisation it is installed on.<br/><br/>A customer-managed key on an existing secret goes in secrets\_kms\_key\_arns. | <pre>object({<br/>    source                  = optional(string, "create_secret")<br/>    secret_arn              = optional(string)<br/>    recovery_window_in_days = optional(number, 30)<br/>    ssm = optional(object({<br/>      app_id_parameter_name             = string<br/>      private_key_base64_parameter_name = string<br/>    }))<br/>    owners = optional(list(string), [])<br/>  })</pre> | `{}` | no |
+| github\_app | Where the GitHub App credentials that read registered runners (busy, idle, offline, booting)<br/>come from:<br/><br/>  create\_secret     (default) the module creates an empty Secrets Manager secret; put<br/>                    {"app\_id": "...", "private\_key": "<PEM>"} in it. Until then GitHub is skipped.<br/>  existing\_secret   a secret you manage, same JSON, in secret\_arn.<br/>  runner\_ssm        the runner module's own App, from its SSM parameters. Works, but that App<br/>                    can register runners: more access than reading them needs.<br/>  disabled          no GitHub: queue, instance and capacity metrics only.<br/><br/>The recommended App is dedicated and read-only: organisation "Self-hosted runners: Read", plus<br/>repository "Administration: Read" for repository-level runners.<br/><br/>owners (required unless disabled): the organisations or "owner/repo" targets to query; matched<br/>without regard to case. The instances' ghr:Owner tags say where each runner registers, and a<br/>job that can tag its own instance could otherwise point the App at another organisation it is<br/>installed on.<br/><br/>A customer-managed key on an existing secret goes in secrets\_kms\_key\_arns. | <pre>object({<br/>    source                  = optional(string, "create_secret")<br/>    secret_arn              = optional(string)<br/>    recovery_window_in_days = optional(number, 30)<br/>    ssm = optional(object({<br/>      app_id_parameter_name             = string<br/>      private_key_base64_parameter_name = string<br/>    }))<br/>    owners = optional(list(string), [])<br/>  })</pre> | `{}` | no |
 | github\_enterprise\_server\_url | GitHub Enterprise Server base URL (e.g. https://github.example.com) for every stack, overriding what the runner stacks say. null: from each stack, else github.com. | `string` | `null` | no |
 | iam\_role\_path | Path for the function's role. | `string` | `"/"` | no |
 | kms\_key\_arn | Customer-managed KMS key for the log group, the function's environment and the created secret. The key policy must allow logs.<region>.amazonaws.com. null: AWS-managed keys. | `string` | `null` | no |

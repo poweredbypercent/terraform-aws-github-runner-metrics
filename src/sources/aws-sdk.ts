@@ -80,7 +80,7 @@ export const cloudWatchQueueAges =
           { abortSignal },
         )
         for (const result of out.MetricDataResults ?? []) {
-          const name = result.Id === undefined ? undefined : nameById.get(result.Id)
+          const name = nameById.get(result.Id ?? '')
           if (!name) continue
           const values = datapoints.get(name)
           if (values) values.push(...(result.Values ?? []))
@@ -117,14 +117,18 @@ export const ec2RunnerInstances =
     return instances
   }
 
+/** A secret's value, or undefined when it has none yet. */
+export type ReadSecret = (arn: string, signal: AbortSignal) => Promise<string | undefined>
+export type ReadParameter = (name: string, signal: AbortSignal) => Promise<string>
+
 /**
  * A secret's current value, or undefined when it has none yet: the module creates the secret
  * empty, and it has no AWSCURRENT version until someone puts the value in. A secret that does not
  * exist at all (a wrong or deleted ARN) is an error, not "not filled in yet".
  */
 export const secretsManagerValue =
-  (secrets: Send<GetSecretValueCommand, GetSecretValueCommandOutput>) =>
-  async (arn: string, abortSignal: AbortSignal): Promise<string | undefined> => {
+  (secrets: Send<GetSecretValueCommand, GetSecretValueCommandOutput>): ReadSecret =>
+  async (arn, abortSignal) => {
     try {
       const out = await secrets.send(new GetSecretValueCommand({ SecretId: arn }), { abortSignal })
       return out.SecretString?.trim() || undefined
@@ -140,7 +144,7 @@ const isUnfilledSecret = (error: unknown): boolean =>
   /staging label/i.test(error.message)
 
 export const ssmParameterValue =
-  (ssm: Send<GetParameterCommand, GetParameterCommandOutput>) =>
-  async (name: string, abortSignal: AbortSignal): Promise<string> =>
+  (ssm: Send<GetParameterCommand, GetParameterCommandOutput>): ReadParameter =>
+  async (name, abortSignal) =>
     (await ssm.send(new GetParameterCommand({ Name: name, WithDecryption: true }), { abortSignal }))
       .Parameter?.Value ?? ''

@@ -10,6 +10,8 @@ export type QueueKind = 'main' | 'dead_letter'
 export type Lifecycle = 'spot' | 'on-demand'
 export type RunnerType = 'org' | 'repo'
 export type SourceName = 'sqs' | 'cloudwatch' | 'ec2' | 'github'
+/** Which sources answered this sample; a source that is not configured is absent. */
+export type SourceHealth = { readonly [S in SourceName]?: boolean }
 
 /** One of a runner config's scale-up queues, as configured (ARN) and as SQS addresses it (URL). */
 export interface QueueRef {

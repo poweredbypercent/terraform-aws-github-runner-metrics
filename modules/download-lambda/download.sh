@@ -23,7 +23,7 @@ asset="terraform-aws-github-runner-metrics.zip"
 base="https://github.com/${repository}/releases/download/${tag}"
 
 fetch() {
-  curl --fail --silent --show-error --location --proto '=https' --retry 3 \
+  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 3 \
     --max-time 300 --max-filesize 104857600 --output "$2" "$1"
 }
 

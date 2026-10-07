@@ -83,7 +83,8 @@ class Reader {
   }
 }
 
-const ARN_SQS = /^arn:(aws[a-z-]*):sqs:([a-z0-9-]+):(\d{12}):([A-Za-z0-9_-]{1,80})$/
+/** Standard or FIFO (`.fifo`) queues. */
+const ARN_SQS = /^arn:(aws[a-z-]*):sqs:([a-z0-9-]+):(\d{12}):([A-Za-z0-9_-]{1,75}(?:\.fifo)?)$/
 /** One secret, never a wildcard: the role's grant is scoped to exactly what is named here. */
 const ARN_SECRET = /^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:[A-Za-z0-9/_+=.@-]+$/
 const ARN_ROLE = /^arn:aws[a-z-]*:iam::\d{12}:role\/[A-Za-z0-9/_+=,.@-]+$/
@@ -97,6 +98,11 @@ const RESERVED_HEADERS = [
   'user-agent',
   'x-prometheus-remote-write-version',
 ]
+/** SigV4's own headers (x-amz-date, x-amz-security-token, ...) are the signer's to set. */
+const isReservedHeader = (name: string): boolean =>
+  RESERVED_HEADERS.includes(name.toLowerCase()) || name.toLowerCase().startsWith('x-amz-')
+/** An organisation, or "owner/repo", as GitHub names them. */
+const OWNER = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\/[A-Za-z0-9._-]{1,100})?$/
 
 /** SQS endpoints by partition; the URL is derived from the ARN so the config stays small. */
 const DNS_SUFFIX: Record<string, string> = {
@@ -111,7 +117,7 @@ export function queueFromArn(arn: string): Result<QueueRef> {
   const [, partition = '', region = '', account = '', name = ''] = match
   const suffix = DNS_SUFFIX[partition]
   if (!suffix) return err(`${arn} is in partition ${partition}, which is not supported`)
-  const kind: QueueKind = name.endsWith('_dead_letter') ? 'dead_letter' : 'main'
+  const kind: QueueKind = /_dead_letter(\.fifo)?$/.test(name) ? 'dead_letter' : 'main'
   return ok({ arn, name, url: `https://sqs.${region}.${suffix}/${account}/${name}`, kind })
 }
 
@@ -228,7 +234,7 @@ function remoteWrite(r: Reader, value: Json, at: string): RemoteWriteConfig {
     headers: r.stringMap(o.headers, `${at}.headers`, name =>
       !HEADER_NAME.test(name)
         ? 'is not a valid header name'
-        : RESERVED_HEADERS.includes(name.toLowerCase())
+        : isReservedHeader(name)
           ? 'is set by the remote-write client and cannot be overridden'
           : undefined,
     ),
@@ -261,16 +267,19 @@ export function parseConfig(raw: string | undefined): Config {
     if (duplicate) r.problems.push(`runner_configs: ${key} "${duplicate}" appears more than once`)
   }
   const github = r.object(o.github ?? {}, 'github')
+  const credentials = githubCredentials(r, github.credentials, 'github.credentials')
+  const owners = r
+    .array(github.owners ?? [], 'github.owners')
+    // GitHub names are case-insensitive; compared lower-cased (runners.ts).
+    .map((owner, i) => r.string(owner, `github.owners[${i}]`, OWNER).toLowerCase())
+  // The instances' tags name the scopes, and a job may be able to set its own instance's tags:
+  // without an allowlist it could point the App at any organisation the App is installed on.
+  if (credentials.type !== 'none' && owners.length === 0) {
+    r.problems.push('github.owners must list the organisations or "owner/repo" targets to query')
+  }
   const config: Config = {
     runnerConfigs,
-    github: {
-      credentials: githubCredentials(r, github.credentials, 'github.credentials'),
-      owners: r
-        .array(github.owners ?? [], 'github.owners')
-        .map((owner, i) =>
-          r.string(owner, `github.owners[${i}]`, /^[A-Za-z0-9_.-]+(\/[A-Za-z0-9_.-]+)?$/),
-        ),
-    },
+    github: { credentials, owners },
     remoteWrite: remoteWrite(r, o.remote_write, 'remote_write'),
     labels: r.stringMap(o.labels, 'labels', invalidLabelName),
     bootGraceSeconds: r.number(o.boot_grace_seconds ?? 30, 'boot_grace_seconds', 0, 3600),

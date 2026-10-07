@@ -174,6 +174,31 @@ describe('parseConfig', () => {
     )
   })
 
+  it('requires an owners allowlist with GitHub credentials, and lower-cases it', () => {
+    const secretArn = 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-app-AbCdEf'
+    const credentials = { type: 'secret', secret_arn: secretArn }
+    const problems = problemsOf({ ...minimal, github: { credentials } })
+    assert.ok(
+      problems.some(p => /github\.owners must list/.test(p)),
+      problems.join('\n'),
+    )
+    const config = parseConfig(
+      JSON.stringify({ ...minimal, github: { credentials, owners: ['Acme', 'Acme/Widgets'] } }),
+    )
+    assert.deepEqual(config.github.owners, ['acme', 'acme/widgets'])
+  })
+
+  it("keeps the signer's own headers for the signer", () => {
+    const problems = problemsOf({
+      ...minimal,
+      remote_write: { url: minimal.remote_write.url, headers: { 'X-Amz-Security-Token': 'x' } },
+    })
+    assert.ok(
+      problems.some(p => /X-Amz-Security-Token is set by/.test(p)),
+      problems.join('\n'),
+    )
+  })
+
   it('rejects a missing or unparseable CONFIG', () => {
     assert.throws(() => parseConfig(undefined), /CONFIG must be set/)
     assert.throws(() => parseConfig('{'), /CONFIG must be set/)
@@ -188,6 +213,13 @@ describe('queueFromArn', () => {
       queue.value.url,
       'https://sqs.cn-north-1.amazonaws.com.cn/123456789012/ci-queued-builds',
     )
+  })
+
+  it('reads FIFO queues and their dead-letter queues', () => {
+    const main = queueFromArn('arn:aws:sqs:eu-west-1:123456789012:ci-queued-builds.fifo')
+    const dlq = queueFromArn('arn:aws:sqs:eu-west-1:123456789012:ci-queued-builds_dead_letter.fifo')
+    assert.ok(main.ok && dlq.ok)
+    assert.deepEqual([main.value.kind, dlq.value.kind], ['main', 'dead_letter'])
   })
 
   it('refuses partitions it has no endpoint for', () => {

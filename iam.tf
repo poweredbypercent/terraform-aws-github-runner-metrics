@@ -19,14 +19,6 @@ resource "aws_iam_role" "lambda" {
   tags                 = var.tags
 }
 
-locals {
-  secret_arns = compact([local.github_secret_arn, local.remote_write_secret_arn])
-  ssm_parameter_arns = local.github_ssm_parameters == null ? [] : [
-    for name in compact(values(local.github_ssm_parameters)) :
-    "arn:${local.partition}:ssm:${local.region}:${local.account}:parameter/${trimprefix(name, "/")}"
-  ]
-  kms_key_arns = distinct(compact(concat([var.kms_key_arn], var.secrets_kms_key_arns)))
-}
 
 # Least privilege, generated from the inputs: a statement exists only when its feature is used.
 data "aws_iam_policy_document" "lambda" {
@@ -77,11 +69,13 @@ data "aws_iam_policy_document" "lambda" {
       sid       = "AllowDecrypt"
       actions   = ["kms:Decrypt"]
       resources = local.kms_key_arns
-      # Only for what Secrets Manager and SSM hand back, not any ciphertext under a shared key.
+      # Only through the services that hold this module's encrypted data (Secrets Manager, SSM, and
+      # Lambda for its environment), not any ciphertext under a shared key.
       condition {
         test     = "StringEquals"
         variable = "kms:ViaService"
         values = [
+          "lambda.${local.region}.${local.dns_suffix}",
           "secretsmanager.${local.region}.${local.dns_suffix}",
           "ssm.${local.region}.${local.dns_suffix}",
         ]

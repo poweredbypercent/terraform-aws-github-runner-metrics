@@ -171,7 +171,7 @@ run "creates_the_app_secret_by_default" {
 
   variables {
     runner_configs = { ci = { environment = "ci" } }
-    github_app     = {}
+    github_app     = { owners = ["acme"] }
   }
 
   # The created secret's ARN is only known after apply; give the plan one.
@@ -254,7 +254,7 @@ run "reads_the_runner_module_app_from_ssm" {
   command = plan
 
   variables {
-    github_app = { source = "runner_ssm" }
+    github_app = { source = "runner_ssm", owners = ["acme"] }
     runner_stacks = [{
       multi_runner = {
         linux = { lambda_up = { environment = [{ variables = {
@@ -287,7 +287,7 @@ run "reads_the_runner_module_app_from_ssm" {
 run "warns_when_the_runner_module_app_cannot_be_found" {
   command = plan
   variables {
-    github_app     = { source = "runner_ssm" }
+    github_app     = { source = "runner_ssm", owners = ["acme"] }
     runner_configs = { ci = { environment = "ci" } }
   }
   expect_failures = [check.github_app]
@@ -301,6 +301,7 @@ run "reads_an_existing_secret_through_its_key_only" {
     github_app = {
       source     = "existing_secret"
       secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-app-AbCdEf"
+      owners     = ["acme"]
     }
     secrets_kms_key_arns = ["arn:aws:kms:eu-west-1:123456789012:key/1111-2222"]
   }
@@ -316,8 +317,8 @@ run "reads_an_existing_secret_through_its_key_only" {
     condition = jsonencode(flatten([
       for s in data.aws_iam_policy_document.lambda.statement : [for c in s.condition : c.values if c.variable == "kms:ViaService"]
       if contains(s.actions, "kms:Decrypt")
-    ])) == jsonencode(["secretsmanager.eu-west-1.amazonaws.com", "ssm.eu-west-1.amazonaws.com"])
-    error_message = "the key decrypts only through Secrets Manager and SSM"
+    ])) == jsonencode(["lambda.eu-west-1.amazonaws.com", "secretsmanager.eu-west-1.amazonaws.com", "ssm.eu-west-1.amazonaws.com"])
+    error_message = "the key decrypts only through the services holding the module's data"
   }
 }
 
@@ -358,9 +359,29 @@ run "rejects_a_wildcard_secret_arn" {
   command = plan
   variables {
     runner_configs = { ci = { environment = "ci" } }
-    github_app     = { source = "existing_secret", secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:*" }
+    github_app     = { source = "existing_secret", secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:*", owners = ["acme"] }
   }
   expect_failures = [var.github_app]
+}
+
+run "requires_an_owners_allowlist_with_github" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    github_app     = {}
+  }
+  expect_failures = [var.github_app]
+}
+
+run "warns_about_a_runner_config_name_in_two_stacks" {
+  command = plan
+  variables {
+    runner_stacks = [
+      { multi_runner = { linux = { lambda_up = { environment = [{ variables = { ENVIRONMENT = "a-linux" } }] } } } },
+      { multi_runner = { linux = { lambda_up = { environment = [{ variables = { ENVIRONMENT = "b-linux" } }] } } } },
+    ]
+  }
+  expect_failures = [check.runner_configs]
 }
 
 run "rejects_credentials_over_plain_http" {

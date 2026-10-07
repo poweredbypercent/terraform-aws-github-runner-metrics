@@ -7,9 +7,11 @@ import type { GitHubAppClient } from './client.ts'
 const PER_PAGE = 100
 
 /**
- * The registered runners of every scope the stack's instances register in. Each scope is read on
- * its own: an organisation the App is not installed on fails alone, and the model leaves booting
- * out only for the runner configs that register there.
+ * The registered runners of every allowed scope the stack's instances register in. The scopes
+ * come from instance tags, which a job may be able to set, so only those in `owners` (lower-cased,
+ * as GitHub names are case-insensitive) are queried. Each scope is read on its own: an
+ * organisation the App is not installed on fails alone, and the model leaves booting out only
+ * for the runner configs that register there.
  */
 export async function readRegisteredRunners(
   client: GitHubAppClient,
@@ -18,9 +20,7 @@ export async function readRegisteredRunners(
   signal: AbortSignal,
 ): Promise<RegisteredRunners> {
   const unique = new Map(scopes.map(s => [scopeKey(s), s]))
-  const wanted = [...unique.values()].filter(
-    s => owners.length === 0 || owners.includes(scopeOwnerName(s)),
-  )
+  const wanted = [...unique.values()].filter(s => owners.includes(scopeOwnerName(s).toLowerCase()))
   return readEach(wanted, scopeKey, scope => listRunners(client, scope, signal))
 }
 

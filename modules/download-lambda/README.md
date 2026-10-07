@@ -18,8 +18,14 @@ module "metrics_lambda" {
 
 It runs a shell script on every plan where Terraform runs (bash, curl, sha256sum or shasum, and gh
 for attestations): a zip already on disk is verified again rather than trusted, and downloaded only
-when it is missing or fails. For locked-down pipelines, copy the verified zip to S3 instead and use
-the module's `lambda_zip.s3`.
+when it is missing or fails. Two consequences:
+
+- Plan and apply must run in the same working directory. A plan saved with `-out` and applied
+  elsewhere (another runner or agent) has no zip there, and the zip is read again at apply.
+- Every plan needs those tools, `terraform destroy` included.
+
+For pipelines where either is a problem, copy the verified zip to S3 instead and use the module's
+`lambda_zip.s3`.
 
 <!-- BEGIN_TF_DOCS -->
 ## Requirements
@@ -50,7 +56,7 @@ No modules.
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
 | release\_tag | The exact release to download, e.g. v1.2.3. Floating tags (v1) are refused: the bytes behind them change. | `string` | n/a | yes |
-| output\_dir | Where to put the zip. Defaults to a directory beside this module. | `string` | `null` | no |
+| output\_dir | Where to put the zip. Defaults to a directory beside this module (inside .terraform/modules when the module is fetched, so a fresh init downloads it again). | `string` | `null` | no |
 | repository | The GitHub repository releases are downloaded from. | `string` | `"poweredbypercent/terraform-aws-github-runner-metrics"` | no |
 | sha256 | The zip's expected SHA-256 (hex), from the release notes: the trust anchor. Set this, verify\_attestation, or both. | `string` | `null` | no |
 | verify\_attestation | Verify the release's build-provenance attestation with `gh attestation verify`: signed by the repository's release workflow, for this tag, on a GitHub-hosted runner. Needs the gh CLI, authenticated, wherever Terraform plans. | `bool` | `false` | no |

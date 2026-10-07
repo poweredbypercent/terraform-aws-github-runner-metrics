@@ -6,6 +6,7 @@ import { SSMClient } from '@aws-sdk/client-ssm'
 import { fromNodeProviderChain, fromTemporaryCredentials } from '@aws-sdk/credential-providers'
 import type { AwsCredentialIdentity } from '@smithy/types'
 import { type Cached, cached } from './cache.ts'
+
 import { parseConfig } from './config/parse.ts'
 import type { Config, SigV4Auth } from './config/types.ts'
 import { jsonLogger } from './log.ts'
@@ -18,6 +19,8 @@ import { readInstances, readQueueAges, readQueueDepths } from './sources/aws.ts'
 import {
   cloudWatchQueueAges,
   ec2RunnerInstances,
+  type ReadParameter,
+  type ReadSecret,
   secretsManagerValue,
   sqsQueueAttributes,
   ssmParameterValue,
@@ -42,11 +45,13 @@ import { readRegisteredRunners } from './sources/github/runners.ts'
 declare const __VERSION__: string
 const VERSION = typeof __VERSION__ === 'string' ? __VERSION__ : 'dev'
 const USER_AGENT = `terraform-aws-github-runner-metrics/${VERSION}`
-/** How long a secret or the App's credentials are kept before being read again. */
-const CREDENTIALS_TTL_MS = 10 * 60_000
-
-type ReadSecret = ReturnType<typeof secretsManagerValue>
-type ReadParameter = ReturnType<typeof ssmParameterValue>
+/**
+ * A secret or the App's credentials, kept for ten minutes before being read again (so a rotation
+ * is picked up within that), and not kept at all until there is a value (so a secret filled in
+ * after deploy is used at the next sample).
+ */
+const cachedCredential = <T>(load: (signal: AbortSignal) => Promise<T | undefined>) =>
+  cached(load, 10 * 60_000, Date.now)
 
 function githubCredentials(
   config: Config,
@@ -58,26 +63,18 @@ function githubCredentials(
     case 'none':
       return undefined
     case 'secret':
-      return cached(
-        async signal => {
-          const raw = await readSecret(credentials.secretArn, signal)
-          return raw === undefined ? undefined : parseAppSecret(raw)
-        },
-        CREDENTIALS_TTL_MS,
-        Date.now,
-      )
+      return cachedCredential(async signal => {
+        const raw = await readSecret(credentials.secretArn, signal)
+        return raw === undefined ? undefined : parseAppSecret(raw)
+      })
     case 'ssm':
-      return cached(
-        async signal => {
-          const [appId, key] = await Promise.all([
-            readParameter(credentials.appIdParameter, signal),
-            readParameter(credentials.privateKeyParameter, signal),
-          ])
-          return credentialsFromRunnerModule(appId, key)
-        },
-        CREDENTIALS_TTL_MS,
-        Date.now,
-      )
+      return cachedCredential(async signal => {
+        const [appId, key] = await Promise.all([
+          readParameter(credentials.appIdParameter, signal),
+          readParameter(credentials.privateKeyParameter, signal),
+        ])
+        return credentialsFromRunnerModule(appId, key)
+      })
   }
 }
 
@@ -132,7 +129,7 @@ export function buildDeps(env: NodeJS.ProcessEnv): Deps {
     sink: remoteWriteSink({
       url: config.remoteWrite.url,
       auth: authFromConfig(config.remoteWrite.auth, {
-        secret: arn => cached(signal => readSecret(arn, signal), CREDENTIALS_TTL_MS, Date.now),
+        secret: arn => cachedCredential(signal => readSecret(arn, signal)),
         credentialsFor: writerCredentials,
       }),
       headers: config.remoteWrite.headers,

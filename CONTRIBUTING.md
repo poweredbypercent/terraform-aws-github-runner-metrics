@@ -46,9 +46,14 @@ These are settings, not files, so they are listed here for whoever administers t
 - **Environment `release`** (Settings > Environments): required reviewers (at least one person other
   than whoever pushes tags), "Prevent self-review" on, and deployment limited to tags matching
   `v*`. The publish job waits on it.
+- **A release GitHub App**, owned by the organisation, installed on this repository only, with
+  Repository permission **Contents: Read and write** and nothing else. Store its client id and a
+  private key as the secrets `RELEASE_APP_CLIENT_ID` and `RELEASE_APP_PRIVATE_KEY` of the
+  `release` environment (not of the repository), so they exist only for an approved release. The
+  publish job moves the floating `vX` and `vX.Y` tags with its token.
 - **Tag ruleset for `v*`** (Settings > Rules > Rulesets, target: tags): restrict creation, update
-  and deletion to maintainers, with a bypass for GitHub Actions so the workflow can move the
-  floating `vX` and `vX.Y` tags.
+  and deletion, with bypass for the maintainers who push release tags and for the release App.
+  Do not add GitHub Actions as a bypass: that would let any workflow's token move `v1`.
 - **Immutable releases** (Settings > General > Releases): on, so a published release's assets and
   tag cannot be replaced. Releases are created as drafts and published once complete, which this
   needs.

@@ -25,13 +25,18 @@ export class PushError extends Error {
 /**
  * Only a 400's body is kept: it says which samples were rejected and why ("out of order sample").
  * Any other body may be a proxy's page echoing the request, Authorization header included, so it
- * is not logged.
+ * is not logged - and in case a 400 page echoes it too, anything shaped like a credential is
+ * redacted from that one.
  */
+const CREDENTIAL =
+  /\b(authorization|x-amz-security-token|x-amz-signature|signature|bearer|basic)\b\s*[:=]?\s*(?:(?:bearer|basic|aws4-hmac-sha256)\s+)?\S+/gi
+
 async function explain(response: Response): Promise<string> {
   if (response.status !== 400) return ''
   const body = await response.text().catch(() => '')
   return ` ${body
     .replace(/[^\x20-\x7e]+/g, ' ')
+    .replace(CREDENTIAL, '$1 [redacted]')
     .trim()
     .slice(0, 300)}`.trimEnd()
 }

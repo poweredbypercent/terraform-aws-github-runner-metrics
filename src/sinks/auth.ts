@@ -29,7 +29,7 @@ export interface Auth {
   refused(): void
 }
 
-const bytes = (data: SourceData): string | Uint8Array =>
+const toHashInput = (data: SourceData): string | Uint8Array =>
   typeof data === 'string'
     ? data
     : ArrayBuffer.isView(data)
@@ -40,7 +40,8 @@ const bytes = (data: SourceData): string | Uint8Array =>
 class Sha256 implements Checksum {
   private readonly hash
   constructor(secret?: SourceData) {
-    this.hash = secret === undefined ? createHash('sha256') : createHmac('sha256', bytes(secret))
+    this.hash =
+      secret === undefined ? createHash('sha256') : createHmac('sha256', toHashInput(secret))
   }
   update(data: Uint8Array): void {
     this.hash.update(data)

@@ -8,8 +8,11 @@ check "runner_configs" {
   }
 
   assert {
-    condition     = length(local.runner_configs) == length(local.derived_runner_configs) + length(local.explicit_runner_configs)
-    error_message = "A runner_configs key repeats a runner config name derived from runner_stacks; every runner_config label must be unique."
+    condition = (
+      length(local.stack_config_names) == length(local.stack_variables) &&
+      length(local.runner_configs) == length(local.derived_runner_configs) + length(local.explicit_runner_configs)
+    )
+    error_message = "A runner config name appears more than once (in two runner_stacks, or in runner_stacks and runner_configs); every runner_config label must be unique."
   }
 
   assert {

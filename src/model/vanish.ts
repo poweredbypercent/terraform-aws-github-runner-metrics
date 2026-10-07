@@ -1,4 +1,4 @@
-import type { SourceName } from '../domain/types.ts'
+import type { SourceHealth } from '../domain/types.ts'
 import { ALL_METRICS, type Sample, seriesKey } from './catalogue.ts'
 
 /**
@@ -15,7 +15,7 @@ import { ALL_METRICS, type Sample, seriesKey } from './catalogue.ts'
 export interface VanishTracker {
   apply(
     samples: readonly Sample[],
-    up: { readonly [S in SourceName]?: boolean },
+    up: SourceHealth,
     now: number,
   ): { readonly samples: Sample[]; commit(): void }
 }

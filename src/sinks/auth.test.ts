@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { cached } from '../cache.ts'
+import { cachedForTest, signal } from '../test/fixtures.ts'
 import { authFromConfig, basicAuth, bearerAuth, noAuth, sigv4Auth } from './auth.ts'
 
 const AMP =
@@ -14,13 +14,7 @@ const request = {
   },
   body: Uint8Array.from([1, 2, 3, 4, 5]),
 }
-const signal = new AbortController().signal
-const secret = (value: string | undefined) =>
-  cached(
-    async () => value,
-    60_000,
-    () => 0,
-  )
+const secret = (value: string | undefined) => cachedForTest(() => value)
 
 describe('sigv4Auth', () => {
   it('signs a remote_write request for aps, session token included', async () => {
@@ -67,13 +61,7 @@ describe('basic and bearer auth', () => {
 
   it('reads the secret again once the receiver has refused it', async () => {
     let token = 'old'
-    const auth = bearerAuth(
-      cached(
-        async () => token,
-        60_000,
-        () => 0,
-      ),
-    )
+    const auth = bearerAuth(cachedForTest(() => token))
     assert.equal((await auth.sign(request, signal)).authorization, 'Bearer old')
     token = 'new'
     assert.equal((await auth.sign(request, signal)).authorization, 'Bearer old')

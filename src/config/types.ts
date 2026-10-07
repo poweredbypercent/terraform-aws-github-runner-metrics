@@ -23,7 +23,7 @@ export type GitHubCredentials =
 
 export interface GitHubConfig {
   readonly credentials: GitHubCredentials
-  /** When non-empty, only these "org" or "owner/repo" targets are queried. */
+  /** The only "org" or "owner/repo" targets queried, lower-cased; required with credentials. */
   readonly owners: readonly string[]
 }
 

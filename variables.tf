@@ -111,9 +111,10 @@ variable "github_app" {
     The recommended App is dedicated and read-only: organisation "Self-hosted runners: Read", plus
     repository "Administration: Read" for repository-level runners.
 
-    owners: the organisations or "owner/repo" targets to query. Set it: by default every one the
-    runner instances' ghr:Owner tags name is queried, and a job that can tag its own instance can
-    then point the App at another organisation it is installed on.
+    owners (required unless disabled): the organisations or "owner/repo" targets to query; matched
+    without regard to case. The instances' ghr:Owner tags say where each runner registers, and a
+    job that can tag its own instance could otherwise point the App at another organisation it is
+    installed on.
 
     A customer-managed key on an existing secret goes in secrets_kms_key_arns.
   EOT
@@ -148,6 +149,13 @@ variable "github_app" {
   validation {
     condition     = alltrue([for o in var.github_app.owners : can(regex("^[A-Za-z0-9][A-Za-z0-9-]{0,38}(/[A-Za-z0-9._-]{1,100})?$", o))])
     error_message = "github_app.owners entries must be an organisation or \"owner/repo\"."
+  }
+
+  validation {
+    # The instances' tags name the scopes to query, and a job may be able to set its own
+    # instance's tags; the allowlist keeps the App to the organisations meant.
+    condition     = var.github_app.source == "disabled" || length(var.github_app.owners) > 0
+    error_message = "github_app.owners must list the organisations (or \"owner/repo\") your runners register in, unless GitHub is disabled."
   }
 
   validation {
@@ -255,9 +263,10 @@ variable "remote_write" {
     condition = alltrue([
       for name in keys(var.remote_write.headers) :
       can(regex("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$", name)) &&
-      !contains(["authorization", "content-encoding", "content-type", "content-length", "host", "user-agent", "x-prometheus-remote-write-version"], lower(name))
+      !contains(["authorization", "content-encoding", "content-type", "content-length", "host", "user-agent", "x-prometheus-remote-write-version"], lower(name)) &&
+      !startswith(lower(name), "x-amz-")
     ])
-    error_message = "remote_write.headers must be valid header names and cannot override Authorization or the remote-write protocol headers."
+    error_message = "remote_write.headers must be valid header names and cannot override Authorization, the remote-write protocol headers or SigV4's x-amz-* headers."
   }
 
   validation {
