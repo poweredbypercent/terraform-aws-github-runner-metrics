@@ -204,8 +204,10 @@ time() - max(github_aws_runners_last_sample_timestamp_seconds) > 300
 
 The runner module's own `metrics` option publishes event metrics to CloudWatch (GitHub App rate
 limit, job retries, spot interruptions). This module adds the fleet's state as Prometheus gauges;
-the two complement each other. It answers
+the two complement each other. It covers the fleet monitoring asked for in
 [github-aws-runners/terraform-aws-github-runner#2025](https://github.com/github-aws-runners/terraform-aws-github-runner/issues/2025).
+For how it compares with exporters you may already run (YACE, GitHub runner exporters), and when
+one of those is enough, see [docs/alternatives.md](docs/alternatives.md).
 CI validates the examples against the runner module v6.5 (AWS provider 5.x) and v7.11 (6.x), the
 module with Terraform 1.5 and the latest release on both provider majors (and the 5.77 floor), and
 runs the module's `terraform test` suite on Terraform 1.11 and later; the Lambda's tests run on
