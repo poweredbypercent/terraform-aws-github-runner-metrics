@@ -29,8 +29,14 @@ resource "aws_lambda_function" "this" {
   timeout       = var.lambda_timeout
   kms_key_arn   = var.kms_key_arn
 
-  filename          = var.lambda_zip.path
-  source_code_hash  = var.lambda_zip.path == null ? null : coalesce(var.lambda_zip.source_code_hash, filebase64sha256(var.lambda_zip.path))
+  filename = var.lambda_zip.path
+  # A conditional, not coalesce(): coalesce reads the file even when a hash is given, and the zip
+  # may not exist until a later step.
+  source_code_hash = (
+    var.lambda_zip.path == null ? null :
+    var.lambda_zip.source_code_hash != null ? var.lambda_zip.source_code_hash :
+    filebase64sha256(var.lambda_zip.path)
+  )
   s3_bucket         = try(var.lambda_zip.s3.bucket, null)
   s3_key            = try(var.lambda_zip.s3.key, null)
   s3_object_version = try(var.lambda_zip.s3.object_version, null)

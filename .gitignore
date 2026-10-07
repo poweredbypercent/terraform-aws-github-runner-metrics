@@ -17,4 +17,4 @@ modules/download-lambda/.build/
 .vscode/
 
 # Written by CI to pin the AWS provider major for a matrix leg.
-ci_aws_provider.tf
+ci_aws_provider_override.tf

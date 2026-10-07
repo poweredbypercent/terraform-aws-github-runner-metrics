@@ -59,19 +59,20 @@ export interface RegisteredRunner {
   readonly scope: GitHubScope
 }
 
-/** Results that may succeed for some items and fail for others, e.g. per queue or per scope. */
-export interface PartialResult<K, V> {
-  readonly values: ReadonlyMap<K, V>
-  readonly failed: readonly K[]
+/** Results read item by item (per queue, per scope): what was read, keyed, and what failed. */
+export interface PartialResult<V> {
+  readonly values: ReadonlyMap<string, V>
+  readonly failed: readonly string[]
 }
 
 export interface Snapshot {
   /** Epoch milliseconds at the start of the sample; every series carries it. */
   readonly now: number
-  readonly depths: PartialResult<string, QueueDepth> | undefined
+  /** Keyed by queue ARN. */
+  readonly depths: PartialResult<QueueDepth> | undefined
+  /** Keyed by queue ARN. */
   readonly ages: ReadonlyMap<string, number> | undefined
   readonly instances: readonly RunnerInstance[] | undefined
-  readonly runners: PartialResult<string, readonly RegisteredRunner[]> | undefined
-  /** Only the sources that were attempted; GitHub without credentials is not attempted. */
-  readonly up: { readonly [S in SourceName]?: boolean }
+  /** Keyed by scope (see scopeKey). */
+  readonly runners: PartialResult<readonly RegisteredRunner[]> | undefined
 }

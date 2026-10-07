@@ -36,3 +36,8 @@ variable "metrics_release_sha256" {
   description = "SHA-256 of the release zip, from its release notes."
   type        = string
 }
+
+variable "github_owners" {
+  description = "The organisations (or \"owner/repo\") the runners register in."
+  type        = list(string)
+}

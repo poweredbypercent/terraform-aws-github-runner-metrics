@@ -75,9 +75,10 @@ jobs:
       fail-fast: false
       matrix:
         # The oldest Terraform the module claims (required_version >= 1.5) and the newest; both
-        # AWS provider majors runner stacks are on (terraform-aws-github-runner v6: 5.x, v7: 6.x).
+        # AWS provider majors runner stacks are on (terraform-aws-github-runner v6: 5.x, v7: 6.x),
+        # and the 5.77 floor versions.tf allows.
         terraform: ['1.5.7', 'latest']
-        aws: ['5', '6']
+        aws: ['= 5.77.0', '~> 5.77', '~> 6.0']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -86,12 +87,12 @@ jobs:
         with:
           terraform_version: ${{ matrix.terraform }}
           terraform_wrapper: false
-      - name: Pin the AWS provider major
+      # An override file: a second required_providers block in a plain .tf is an error.
+      - name: Pin the AWS provider
         env:
-          AWS_MAJOR: ${{ matrix.aws }}
+          CONSTRAINT: ${{ matrix.aws }}
         run: |
-          constraint=$([ "${AWS_MAJOR}" = 5 ] && echo '~> 5.77' || echo '~> 6.0')
-          printf 'terraform {\n  required_providers {\n    aws = { source = "hashicorp/aws", version = "%s" }\n  }\n}\n' "${constraint}" >ci_aws_provider.tf
+          printf 'terraform {\n  required_providers {\n    aws = { source = "hashicorp/aws", version = "%s" }\n  }\n}\n' "${CONSTRAINT}" >ci_aws_provider_override.tf
       - run: terraform fmt -check -recursive -diff
       - run: terraform init -backend=false -input=false
       - run: terraform validate
@@ -106,7 +107,7 @@ jobs:
       matrix:
         # The tests use plan-time overrides, which need Terraform 1.11.
         terraform: ['1.11.4', 'latest']
-        aws: ['5', '6']
+        aws: ['= 5.77.0', '~> 5.77', '~> 6.0']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -115,12 +116,11 @@ jobs:
         with:
           terraform_version: ${{ matrix.terraform }}
           terraform_wrapper: false
-      - name: Pin the AWS provider major
+      - name: Pin the AWS provider
         env:
-          AWS_MAJOR: ${{ matrix.aws }}
+          CONSTRAINT: ${{ matrix.aws }}
         run: |
-          constraint=$([ "${AWS_MAJOR}" = 5 ] && echo '~> 5.77' || echo '~> 6.0')
-          printf 'terraform {\n  required_providers {\n    aws = { source = "hashicorp/aws", version = "%s" }\n  }\n}\n' "${constraint}" >ci_aws_provider.tf
+          printf 'terraform {\n  required_providers {\n    aws = { source = "hashicorp/aws", version = "%s" }\n  }\n}\n' "${CONSTRAINT}" >ci_aws_provider_override.tf
       - run: terraform init -backend=false -input=false
       - run: terraform test
 
@@ -158,8 +158,12 @@ jobs:
         with:
           terraform_wrapper: false
       - uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+      # The examples are linted in their own job, once their modules are installed.
       - run: terraform init -backend=false -input=false
-      - run: tflint --init && tflint --recursive --config="$GITHUB_WORKSPACE/.tflint.hcl"
+      - run: |
+          tflint --init
+          tflint --config="$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --chdir=modules/download-lambda --config="$GITHUB_WORKSPACE/.tflint.hcl"
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: terraform-docs/gh-actions@6de6da0cefcc6b4b7a5cbea4d79d97060733093c # v1.4.1

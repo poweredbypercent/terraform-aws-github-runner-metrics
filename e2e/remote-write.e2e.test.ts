@@ -11,7 +11,8 @@ import { parseConfig } from '../src/config/parse.ts'
 import { scopeKey } from '../src/domain/scope.ts'
 import type { GitHubScope, RunnerInstance } from '../src/domain/types.ts'
 import { createVanishTracker } from '../src/model/vanish.ts'
-import { type Deps, type Sources, sampleOnce } from '../src/run.ts'
+import type { Sources } from '../src/ports.ts'
+import { type Deps, sampleOnce } from '../src/run.ts'
 import { noAuth } from '../src/sinks/auth.ts'
 import { remoteWriteSink } from '../src/sinks/remote-write/sink.ts'
 
@@ -99,15 +100,18 @@ describe('remote write to Prometheus', () => {
       }),
       queueAges: async () => new Map([[ARN, 95]]),
       instances: async () => instanceTypes.map((type, i) => instance(`i-0${i}aaaaaaa`, type, now)),
-      registeredRunners: async scopes => ({
-        values: new Map(
-          scopes.map(s => [
-            scopeKey(s),
-            [{ name: 'linuxi-00aaaaaaa', status: 'online' as const, busy: true, scope: s }],
-          ]),
-        ),
-        failed: [],
-      }),
+      github: {
+        isConfigured: async () => true,
+        registeredRunners: async scopes => ({
+          values: new Map(
+            scopes.map(s => [
+              scopeKey(s),
+              [{ name: 'linuxi-00aaaaaaa', status: 'online' as const, busy: true, scope: s }],
+            ]),
+          ),
+          failed: [],
+        }),
+      },
     }
     const sampler = deps(sources, () => now)
 

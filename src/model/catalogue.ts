@@ -16,11 +16,12 @@ export interface MetricDefinition<L extends string = string> {
   /** Where the value comes from; the sampler's own series say `sampler`. */
   readonly source: SourceName | 'config' | 'sampler'
   /**
-   * Label values that come and go (an instance type, an owner): when one disappears while its
-   * source is up, the series is sent as 0 for a few samples rather than left to linger at its
-   * last value for Prometheus' five-minute lookback.
+   * For series whose label values come and go (an instance type, an owner): the source whose
+   * answer says one has gone. When it disappears while that source is up, the series is sent as 0
+   * for a few samples rather than left to linger at its last value for Prometheus' five-minute
+   * lookback. Undefined for label sets the model fills itself.
    */
-  readonly vanishes: boolean
+  readonly vanishWith: SourceName | undefined
 }
 
 /** The label set a metric's series must carry. */
@@ -38,8 +39,21 @@ const define = <const L extends string>(
   help: string,
   labels: readonly L[],
   source: MetricDefinition['source'],
-  vanishes = false,
-): MetricDefinition<L> => ({ name: `${PREFIX}${suffix}`, help, labels, source, vanishes })
+): MetricDefinition<L> => ({
+  name: `${PREFIX}${suffix}`,
+  help,
+  labels,
+  source,
+  vanishWith: undefined,
+})
+
+/** A metric whose label values come and go with what `source` reports. */
+const dynamic = <const L extends string>(
+  suffix: string,
+  help: string,
+  labels: readonly L[],
+  source: SourceName,
+): MetricDefinition<L> => ({ ...define(suffix, help, labels, source), vanishWith: source })
 
 const CONFIG = ['environment', 'runner_config'] as const
 const RUNNERS = [...CONFIG, 'runner_type', 'organization', 'repository'] as const
@@ -63,12 +77,11 @@ export const METRICS = {
     [...CONFIG, 'queue'],
     'cloudwatch',
   ),
-  instances: define(
+  instances: dynamic(
     'instances',
     'Runner EC2 instances, pending or running, by type, purchase option and state. Orphans are counted separately.',
     [...CONFIG, 'instance_type', 'lifecycle', 'state'],
     'ec2',
-    true,
   ),
   orphanInstances: define(
     'orphan_instances',
@@ -82,27 +95,24 @@ export const METRICS = {
     CONFIG,
     'github',
   ),
-  registeredRunners: define(
+  registeredRunners: dynamic(
     'registered_runners',
     'Runners of this stack registered with GitHub, in any state.',
     RUNNERS,
     'github',
-    true,
   ),
-  busyRunners: define('busy_runners', 'Registered runners running a job.', RUNNERS, 'github', true),
-  idleRunners: define(
+  busyRunners: dynamic('busy_runners', 'Registered runners running a job.', RUNNERS, 'github'),
+  idleRunners: dynamic(
     'idle_runners',
     'Registered runners online and waiting for a job (for example a warm pool).',
     RUNNERS,
     'github',
-    true,
   ),
-  offlineRunners: define(
+  offlineRunners: dynamic(
     'offline_runners',
     'Registered runners GitHub reports offline.',
     RUNNERS,
     'github',
-    true,
   ),
   sourceUp: define(
     'source_up',

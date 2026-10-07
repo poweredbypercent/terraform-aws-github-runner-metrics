@@ -12,13 +12,12 @@ const DOS_TIME_MIDNIGHT = 0
 const UNIX_0644_REGULAR_FILE = (0o100644 << 16) >>> 0
 
 export function deterministicZip(files: ReadonlyMap<string, Uint8Array>): Buffer {
-  const names = [...files.keys()].sort()
+  const entries = [...files].sort(([a], [b]) => (a < b ? -1 : 1))
   const locals: Buffer[] = []
   const centrals: Buffer[] = []
   let offset = 0
 
-  for (const name of names) {
-    const data = files.get(name) ?? new Uint8Array()
+  for (const [name, data] of entries) {
     const compressed = deflateRawSync(data, { level: 9 })
     const nameBytes = Buffer.from(name, 'utf8')
     const checksum = crc32(data)
@@ -60,8 +59,8 @@ export function deterministicZip(files: ReadonlyMap<string, Uint8Array>): Buffer
   const directory = Buffer.concat(centrals)
   const end = Buffer.alloc(22)
   end.writeUInt32LE(0x06054b50, 0) // end of central directory signature
-  end.writeUInt16LE(names.length, 8)
-  end.writeUInt16LE(names.length, 10)
+  end.writeUInt16LE(entries.length, 8)
+  end.writeUInt16LE(entries.length, 10)
   end.writeUInt32LE(directory.length, 12)
   end.writeUInt32LE(offset, 16)
   return Buffer.concat([...locals, directory, end])

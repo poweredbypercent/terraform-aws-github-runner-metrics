@@ -7,70 +7,59 @@ import { type LabelsOf, METRICS, type Sample, sample } from './catalogue.ts'
  * A snapshot of the runner stack, as series. Pure: everything it needs is in its arguments.
  *
  * Each family is built only from sources that answered; a failed source leaves its series out
- * (the sampler reports source_up=0 for it), never zero. Label sets that are fixed by the config
- * (a runner config's queues, its orphan and booting counts) are filled with zeros so a quiet
- * runner config still reports; label sets that come and go (instance types, owners) are left to
- * the vanish tracker.
+ * (the sampler reports source_up=0 for it), never zero, and so does a single queue that was not
+ * read. Counts whose label sets are fixed by the config (a runner config's orphans and booting
+ * runners) are filled with zeros so a quiet runner config still reports; label sets that come and
+ * go (instance types, owners) are left to the vanish tracker.
  */
 export function buildSeries(config: Config, snapshot: Snapshot): Sample[] {
   const { now } = snapshot
   const series: Sample[] = []
   const byEnvironment = new Map(config.runnerConfigs.map(c => [c.environment, c]))
-  const base = (c: RunnerConfig) => ({ environment: c.environment, runner_config: c.name })
 
   for (const c of config.runnerConfigs) {
-    if (c.maxRunners !== null) series.push(sample(METRICS.capacity, base(c), c.maxRunners, now))
+    if (c.maxRunners !== null) {
+      series.push(sample(METRICS.capacity, baseLabels(c), c.maxRunners, now))
+    }
   }
 
   if (snapshot.depths) {
-    for (const c of config.runnerConfigs) {
-      for (const queue of c.queues) {
-        const depth = snapshot.depths.values.get(queue.arn)
-        if (!depth) continue
-        for (const [visibility, value] of [
-          ['visible', depth.visible],
-          ['in_flight', depth.inFlight],
-          ['delayed', depth.delayed],
-        ] as const) {
-          series.push(
-            sample(
-              METRICS.queueMessages,
-              { ...base(c), queue: queue.kind, visibility },
-              value,
-              now,
-            ),
-          )
-        }
+    for (const { c, queue } of queuesOf(config)) {
+      const depth = snapshot.depths.values.get(queue.arn)
+      if (!depth) continue
+      for (const [visibility, value] of [
+        ['visible', depth.visible],
+        ['in_flight', depth.inFlight],
+        ['delayed', depth.delayed],
+      ] as const) {
+        const labels = { ...baseLabels(c), queue: queue.kind, visibility }
+        series.push(sample(METRICS.queueMessages, labels, value, now))
       }
     }
   }
 
   if (snapshot.ages) {
-    for (const c of config.runnerConfigs) {
-      for (const queue of c.queues) {
-        const age = snapshot.ages.get(queue.arn)
-        if (age === undefined) continue
-        // CloudWatch has no datapoints for a queue that does not exist either; once SQS has said
-        // which queues exist, a dead-letter queue that is not among them gets no age.
-        if (
-          queue.kind === 'dead_letter' &&
-          snapshot.depths &&
-          !snapshot.depths.values.has(queue.arn)
-        ) {
-          continue
-        }
-        series.push(sample(METRICS.queueAge, { ...base(c), queue: queue.kind }, age, now))
+    for (const { c, queue } of queuesOf(config)) {
+      const age = snapshot.ages.get(queue.arn)
+      if (age === undefined) continue
+      // CloudWatch has no datapoints for a queue that does not exist either; once SQS has said
+      // which queues exist, a dead-letter queue that is not among them gets no age.
+      if (queue.kind === 'dead_letter' && snapshot.depths?.values.has(queue.arn) === false) {
+        continue
       }
+      series.push(sample(METRICS.queueAge, { ...baseLabels(c), queue: queue.kind }, age, now))
     }
   }
 
   const instances = snapshot.instances?.filter(i => byEnvironment.has(i.environment))
   if (instances) {
-    series.push(...instanceSeries(config, instances, now))
+    series.push(...instanceSeries(config, byEnvironment, instances, now))
   }
 
   if (snapshot.runners) {
-    series.push(...runnerSeries(config, snapshot.runners.values, instances, now))
+    series.push(
+      ...runnerSeries(config, byEnvironment, snapshot.runners.values, instances ?? [], now),
+    )
   }
 
   if (instances && snapshot.runners) {
@@ -80,8 +69,16 @@ export function buildSeries(config: Config, snapshot: Snapshot): Sample[] {
   return series.map(s => withRunnerConfigLabels(s, byEnvironment))
 }
 
+type ByEnvironment = ReadonlyMap<string, RunnerConfig>
+
+const baseLabels = (c: RunnerConfig) => ({ environment: c.environment, runner_config: c.name })
+
+const queuesOf = (config: Config) =>
+  config.runnerConfigs.flatMap(c => c.queues.map(queue => ({ c, queue })))
+
 function instanceSeries(
   config: Config,
+  byEnvironment: ByEnvironment,
   instances: readonly RunnerInstance[],
   now: number,
 ): Sample[] {
@@ -94,9 +91,10 @@ function instanceSeries(
       orphans.set(i.environment, (orphans.get(i.environment) ?? 0) + 1)
       continue
     }
+    const c = byEnvironment.get(i.environment)
+    if (!c) continue
     const labels: InstanceLabels = {
-      environment: i.environment,
-      runner_config: configName(config, i.environment),
+      ...baseLabels(c),
       instance_type: i.instanceType,
       lifecycle: i.lifecycle,
       state: i.state,
@@ -109,12 +107,7 @@ function instanceSeries(
   }
   for (const c of config.runnerConfigs) {
     series.push(
-      sample(
-        METRICS.orphanInstances,
-        { environment: c.environment, runner_config: c.name },
-        orphans.get(c.environment) ?? 0,
-        now,
-      ),
+      sample(METRICS.orphanInstances, baseLabels(c), orphans.get(c.environment) ?? 0, now),
     )
   }
   return series
@@ -127,13 +120,14 @@ function instanceSeries(
  */
 function placeRunner(
   config: Config,
+  byEnvironment: ByEnvironment,
   runner: RegisteredRunner,
   environmentOfInstance: ReadonlyMap<string, string>,
 ): RunnerConfig | undefined {
   const id = instanceIdOfRunnerName(runner.name)
   if (!id) return undefined
   const environment = environmentOfInstance.get(id)
-  if (environment) return config.runnerConfigs.find(c => c.environment === environment)
+  if (environment) return byEnvironment.get(environment)
   const byPrefix = config.runnerConfigs.filter(
     c => c.runnerNamePrefix !== '' && runner.name === `${c.runnerNamePrefix}${id}`,
   )
@@ -148,11 +142,12 @@ const scopeLabels = (scope: GitHubScope) => ({
 
 function runnerSeries(
   config: Config,
+  byEnvironment: ByEnvironment,
   byScope: ReadonlyMap<string, readonly RegisteredRunner[]>,
-  instances: readonly RunnerInstance[] | undefined,
+  instances: readonly RunnerInstance[],
   now: number,
 ): Sample[] {
-  const environmentOfInstance = new Map((instances ?? []).map(i => [i.id, i.environment]))
+  const environmentOfInstance = new Map(instances.map(i => [i.id, i.environment]))
   type Counts = { c: RunnerConfig; scope: GitHubScope; busy: number; idle: number; offline: number }
   const counts = new Map<string, Counts>()
   const countsFor = (c: RunnerConfig, scope: GitHubScope): Counts => {
@@ -166,13 +161,13 @@ function runnerSeries(
   }
 
   // A scope this runner config's instances register in reports zeros even with no runners yet.
-  for (const i of instances ?? []) {
-    const c = config.runnerConfigs.find(rc => rc.environment === i.environment)
+  for (const i of instances) {
+    const c = byEnvironment.get(i.environment)
     if (c && i.scope && byScope.has(scopeKey(i.scope))) countsFor(c, i.scope)
   }
   for (const runners of byScope.values()) {
     for (const runner of runners) {
-      const c = placeRunner(config, runner, environmentOfInstance)
+      const c = placeRunner(config, byEnvironment, runner, environmentOfInstance)
       if (!c) continue
       const entry = countsFor(c, runner.scope)
       if (runner.status !== 'online') entry.offline++
@@ -183,7 +178,7 @@ function runnerSeries(
 
   const series: Sample[] = []
   for (const { c, scope, busy, idle, offline } of counts.values()) {
-    const labels = { environment: c.environment, runner_config: c.name, ...scopeLabels(scope) }
+    const labels = { ...baseLabels(c), ...scopeLabels(scope) }
     series.push(
       sample(METRICS.registeredRunners, labels, busy + idle + offline, now),
       sample(METRICS.busyRunners, labels, busy, now),
@@ -222,26 +217,13 @@ function bootingSeries(
     const booting = mine.filter(
       i => !registered.has(i.id) && (i.launchTime === undefined || now - i.launchTime >= grace),
     ).length
-    series.push(
-      sample(
-        METRICS.bootingRunners,
-        { environment: c.environment, runner_config: c.name },
-        booting,
-        now,
-      ),
-    )
+    series.push(sample(METRICS.bootingRunners, baseLabels(c), booting, now))
   }
   return series
 }
 
-const configName = (config: Config, environment: string): string =>
-  config.runnerConfigs.find(c => c.environment === environment)?.name ?? environment
-
-/** A runner config's own constant labels; the global ones are added to every series by run(). */
-function withRunnerConfigLabels(
-  s: Sample,
-  byEnvironment: ReadonlyMap<string, RunnerConfig>,
-): Sample {
+/** A runner config's own constant labels; the global ones are added to every series by run.ts. */
+function withRunnerConfigLabels(s: Sample, byEnvironment: ByEnvironment): Sample {
   const perConfig = s.labels.environment
     ? byEnvironment.get(s.labels.environment)?.labels
     : undefined

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { describeError, settle } from './result.ts'
+import { describeError } from './result.ts'
+import { readEach, settle } from './settle.ts'
 
 describe('settle', () => {
   it('returns the value of a source that finishes in time', async () => {
@@ -28,5 +29,34 @@ describe('settle', () => {
 
   it('describes non-Error throws', () => {
     assert.equal(describeError('plain'), 'plain')
+  })
+})
+
+describe('readEach', () => {
+  const read = async (item: string) => {
+    if (item === 'broken') throw new Error('AccessDenied')
+    if (item === 'absent') return undefined
+    return item.length
+  }
+
+  it('keeps what could be read, lists what failed, and skips what does not exist', async () => {
+    const result = await readEach(['abc', 'broken', 'absent'], item => item, read)
+    assert.deepEqual([...result.values], [['abc', 3]])
+    assert.deepEqual(result.failed, ['broken'])
+  })
+
+  it('fails as a whole when nothing could be read', async () => {
+    await assert.rejects(
+      readEach(
+        ['a', 'b'],
+        item => item,
+        () => Promise.reject(new Error('x')),
+      ),
+      /none of 2 could be read/,
+    )
+  })
+
+  it('succeeds with nothing to read', async () => {
+    assert.deepEqual(await readEach([], item => item, read), { values: new Map(), failed: [] })
   })
 })

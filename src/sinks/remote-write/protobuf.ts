@@ -1,4 +1,5 @@
 import type { Sample } from '../../model/catalogue.ts'
+import { varint } from './varint.ts'
 
 /**
  * Prometheus remote_write 1.0 request body (prometheus.WriteRequest), hand-encoded: four message
@@ -12,17 +13,6 @@ import type { Sample } from '../../model/catalogue.ts'
  * The spec requires labels sorted by name with __name__ among them, and no empty values: an empty
  * value means "no such label", so those are dropped here rather than sent.
  */
-
-function varint(n: number): Uint8Array {
-  const bytes: number[] = []
-  let v = BigInt(n)
-  while (v >= 0x80n) {
-    bytes.push(Number((v & 0x7fn) | 0x80n))
-    v >>= 7n
-  }
-  bytes.push(Number(v))
-  return Uint8Array.from(bytes)
-}
 
 const concat = (parts: readonly Uint8Array[]): Uint8Array => Buffer.concat(parts)
 const utf8 = (s: string): Uint8Array => Buffer.from(s, 'utf8')
@@ -45,11 +35,10 @@ const label = (name: string, value: string): Uint8Array =>
 export function encodeWriteRequest(samples: readonly Sample[]): Uint8Array {
   return concat(
     samples.map(s => {
-      const labels: Record<string, string> = { ...s.labels, __name__: s.name }
-      const encoded = Object.keys(labels)
-        .filter(name => labels[name] !== '')
-        .sort()
-        .map(name => label(name, labels[name] ?? ''))
+      const encoded = Object.entries({ ...s.labels, __name__: s.name })
+        .filter(([, value]) => value !== '')
+        .sort(([a], [b]) => (a < b ? -1 : 1))
+        .map(([name, value]) => label(name, value))
       const point = lengthDelimited(2, concat([double(1, s.value), int64(2, s.timestamp)]))
       return lengthDelimited(1, concat([...encoded, point]))
     }),

@@ -1,8 +1,8 @@
 terraform {
   required_version = ">= 1.5"
   required_providers {
-    local = {
-      source  = "hashicorp/local"
+    external = {
+      source  = "hashicorp/external"
       version = ">= 2.2"
     }
   }
@@ -19,7 +19,7 @@ variable "release_tag" {
 }
 
 variable "sha256" {
-  description = "The zip's expected SHA-256 (hex), from the release notes. Recommended: it is the trust anchor; without it the release's own checksum file is used, which catches corruption but not a tampered release."
+  description = "The zip's expected SHA-256 (hex), from the release notes: the trust anchor. Set this, verify_attestation, or both."
   type        = string
   default     = null
 
@@ -30,7 +30,7 @@ variable "sha256" {
 }
 
 variable "verify_attestation" {
-  description = "Also verify the release's build-provenance attestation with `gh attestation verify` (needs the gh CLI, authenticated)."
+  description = "Verify the release's build-provenance attestation with `gh attestation verify`: signed by the repository's release workflow, for this tag, on a GitHub-hosted runner. Needs the gh CLI, authenticated, wherever Terraform plans."
   type        = bool
   default     = false
 }
@@ -39,6 +39,11 @@ variable "repository" {
   description = "The GitHub repository releases are downloaded from."
   type        = string
   default     = "poweredbypercent/terraform-aws-github-runner-metrics"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$", var.repository))
+    error_message = "repository must be \"owner/name\"."
+  }
 }
 
 variable "output_dir" {
@@ -52,34 +57,29 @@ locals {
   zip_path   = "${local.output_dir}/terraform-aws-github-runner-metrics-${var.release_tag}.zip"
 }
 
-resource "terraform_data" "download" {
-  # fileexists: a fresh checkout (CI) has no zip even though state says it was downloaded.
-  triggers_replace = [var.release_tag, var.sha256, var.verify_attestation, var.repository, fileexists(local.zip_path)]
+# A data source rather than a resource: it runs on every plan, so the zip on disk is verified each
+# time (not trusted because state says it was downloaded once), and the script only downloads when
+# that zip is missing or does not verify.
+data "external" "zip" {
+  program = [
+    "bash", "${path.module}/download.sh",
+    var.repository, var.release_tag, local.zip_path, var.sha256 == null ? "" : var.sha256, tostring(var.verify_attestation),
+  ]
 
-  provisioner "local-exec" {
-    interpreter = ["bash", "-c"]
-    command     = file("${path.module}/download.sh")
-    environment = {
-      REPOSITORY      = var.repository
-      TAG             = var.release_tag
-      OUT             = local.zip_path
-      EXPECTED_SHA256 = coalesce(var.sha256, "")
-      VERIFY          = tostring(var.verify_attestation)
+  lifecycle {
+    precondition {
+      condition     = var.sha256 != null || var.verify_attestation
+      error_message = "Set sha256 (from the release notes) or verify_attestation: without one, nothing anchors trust in the release."
     }
   }
 }
 
-data "local_file" "zip" {
-  filename   = local.zip_path
-  depends_on = [terraform_data.download]
-}
-
 output "path" {
   description = "The verified zip, for lambda_zip.path."
-  value       = data.local_file.zip.filename
+  value       = data.external.zip.result.path
 }
 
 output "source_code_hash" {
   description = "The zip's base64 SHA-256, for lambda_zip.source_code_hash."
-  value       = data.local_file.zip.content_base64sha256
+  value       = filebase64sha256(data.external.zip.result.path)
 }

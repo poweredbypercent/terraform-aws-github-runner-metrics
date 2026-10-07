@@ -13,15 +13,40 @@ check "runner_configs" {
   }
 
   assert {
+    # The same rule the Lambda applies; a multi-runner map key becomes the name.
+    condition     = alltrue([for name in keys(local.runner_configs) : can(regex("^[A-Za-z0-9_.-]+$", name))])
+    error_message = "Runner config names (multi-runner keys, runner_stacks[].name, runner_configs keys) may contain only letters, digits, '.', '-' and '_'."
+  }
+
+  assert {
     condition     = alltrue([for c in values(local.runner_configs) : c.environment != null && c.environment != ""])
     error_message = "A runner stack's scale-up Lambda has no ENVIRONMENT variable. Pass the runner module's outputs unchanged, or describe the stack in runner_configs."
+  }
+
+  assert {
+    # The Lambda's SQS and CloudWatch clients are in its own region.
+    condition     = alltrue([for arn in local.queue_arns : split(":", arn)[3] == local.region])
+    error_message = "Every queue must be in the region this module is deployed in; deploy one instance of the module per region."
   }
 }
 
 check "github_app" {
   assert {
-    condition     = local.github_ssm_parameters == null || !contains(values(local.github_ssm_parameters), "unset")
+    condition     = local.github_ssm_parameters == null || length(compact(values(local.github_ssm_parameters))) == 2
     error_message = "github_app.source = \"runner_ssm\" but the runner module's GitHub App parameter names were not found; set github_app.ssm."
+  }
+
+  assert {
+    condition     = local.github_ssm_parameters == null || var.github_app.ssm != null || length(local.stack_ssm_parameters) <= 1
+    error_message = "github_app.source = \"runner_ssm\" reads one App, but the runner stacks use different ones; set github_app.ssm, or use a dedicated App."
+  }
+}
+
+check "timeout_budget" {
+  assert {
+    # GitHub waits for EC2, so two source budgets run back to back, then the push.
+    condition     = var.lambda_timeout >= 2 * var.source_timeout_seconds + var.remote_write.timeout_seconds + 5
+    error_message = "lambda_timeout is too short to finish a slow sample: it needs 2 x source_timeout_seconds + remote_write.timeout_seconds + 5 seconds."
   }
 }
 

@@ -1,21 +1,27 @@
-import {
-  CloudWatchClient,
-  GetMetricDataCommand,
-  type MetricDataQuery,
-} from '@aws-sdk/client-cloudwatch'
-import { DescribeInstancesCommand, EC2Client, type Instance } from '@aws-sdk/client-ec2'
-import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager'
-import { GetQueueAttributesCommand, SQSClient } from '@aws-sdk/client-sqs'
-import { GetParameterCommand, SSMClient } from '@aws-sdk/client-ssm'
+import { CloudWatchClient } from '@aws-sdk/client-cloudwatch'
+import { EC2Client } from '@aws-sdk/client-ec2'
+import { SecretsManagerClient } from '@aws-sdk/client-secrets-manager'
+import { SQSClient } from '@aws-sdk/client-sqs'
+import { SSMClient } from '@aws-sdk/client-ssm'
 import { fromNodeProviderChain, fromTemporaryCredentials } from '@aws-sdk/credential-providers'
+import type { AwsCredentialIdentity } from '@smithy/types'
+import { type Cached, cached } from './cache.ts'
 import { parseConfig } from './config/parse.ts'
-import type { Config, RemoteWriteAuth } from './config/types.ts'
+import type { Config, SigV4Auth } from './config/types.ts'
 import { jsonLogger } from './log.ts'
 import { createVanishTracker } from './model/vanish.ts'
+import type { GitHubSource } from './ports.ts'
 import { type Deps, type Outcome, sampleOnce } from './run.ts'
-import { type AwsCredentials, authFromConfig } from './sinks/auth.ts'
+import { authFromConfig } from './sinks/auth.ts'
 import { remoteWriteSink } from './sinks/remote-write/sink.ts'
 import { readInstances, readQueueAges, readQueueDepths } from './sources/aws.ts'
+import {
+  cloudWatchQueueAges,
+  ec2RunnerInstances,
+  secretsManagerValue,
+  sqsQueueAttributes,
+  ssmParameterValue,
+} from './sources/aws-sdk.ts'
 import { createGitHubAppClient } from './sources/github/client.ts'
 import {
   type AppCredentials,
@@ -25,110 +31,92 @@ import {
 import { readRegisteredRunners } from './sources/github/runners.ts'
 
 /**
- * The Lambda entry point and the only place that touches AWS clients, fetch and the environment:
- * everything else takes what it needs as arguments. Dependencies are built once per container
- * and kept while it is warm, so caches (GitHub tokens, writer credentials, the vanish tracker)
- * survive from one minute's sample to the next.
+ * The Lambda entry point and composition root: the only place that reads the environment and
+ * creates AWS clients. It holds no logic of its own - the SDK calls are in sources/aws-sdk.ts -
+ * only the wiring. Dependencies are built once per container and kept while it is warm, so caches
+ * (GitHub tokens, secrets, writer credentials, the vanish tracker) survive from one minute's
+ * sample to the next.
  */
 
 /** Set at build time from package.json; "dev" when run from source. */
 declare const __VERSION__: string
 const VERSION = typeof __VERSION__ === 'string' ? __VERSION__ : 'dev'
 const USER_AGENT = `terraform-aws-github-runner-metrics/${VERSION}`
-const SECRET_TTL_MS = 10 * 60_000
+/** How long a secret or the App's credentials are kept before being read again. */
+const CREDENTIALS_TTL_MS = 10 * 60_000
 
-/** A Secrets Manager secret's value, cached; undefined when it has not been given one yet. */
-function secretReader(
-  client: SecretsManagerClient,
-): (arn: string, signal?: AbortSignal) => Promise<string | undefined> {
-  const cache = new Map<string, { value: string | undefined; readAt: number }>()
-  return async (arn, signal) => {
-    const cached = cache.get(arn)
-    if (cached && Date.now() - cached.readAt < SECRET_TTL_MS && cached.value !== undefined)
-      return cached.value
-    let value: string | undefined
-    try {
-      const out = await client.send(
-        new GetSecretValueCommand({ SecretId: arn }),
-        signal ? { abortSignal: signal } : {},
-      )
-      value = out.SecretString?.trim() || undefined
-    } catch (err) {
-      // Created empty by the module: there is no version until someone puts the value in.
-      if ((err as { name?: string }).name !== 'ResourceNotFoundException') throw err
-    }
-    cache.set(arn, { value, readAt: Date.now() })
-    return value
-  }
-}
+type ReadSecret = ReturnType<typeof secretsManagerValue>
+type ReadParameter = ReturnType<typeof ssmParameterValue>
 
-function githubCredentialsLoader(
+function githubCredentials(
   config: Config,
-  secrets: ReturnType<typeof secretReader>,
-  ssm: SSMClient,
-): ((signal: AbortSignal) => Promise<AppCredentials | undefined>) | undefined {
+  readSecret: ReadSecret,
+  readParameter: ReadParameter,
+): Cached<AppCredentials> | undefined {
   const credentials = config.github.credentials
   switch (credentials.type) {
     case 'none':
       return undefined
     case 'secret':
-      return async signal => {
-        const raw = await secrets(credentials.secretArn, signal)
-        return raw ? parseAppSecret(raw) : undefined
-      }
+      return cached(
+        async signal => {
+          const raw = await readSecret(credentials.secretArn, signal)
+          return raw === undefined ? undefined : parseAppSecret(raw)
+        },
+        CREDENTIALS_TTL_MS,
+        Date.now,
+      )
     case 'ssm':
-      return async signal => {
-        const read = async (Name: string) =>
-          (
-            await ssm.send(new GetParameterCommand({ Name, WithDecryption: true }), {
-              abortSignal: signal,
-            })
-          ).Parameter?.Value ?? ''
-        const [appId, key] = await Promise.all([
-          read(credentials.appIdParameter),
-          read(credentials.privateKeyParameter),
-        ])
-        return credentialsFromRunnerModule(appId, key)
-      }
+      return cached(
+        async signal => {
+          const [appId, key] = await Promise.all([
+            readParameter(credentials.appIdParameter, signal),
+            readParameter(credentials.privateKeyParameter, signal),
+          ])
+          return credentialsFromRunnerModule(appId, key)
+        },
+        CREDENTIALS_TTL_MS,
+        Date.now,
+      )
   }
 }
 
-function writerCredentials(
-  auth: Extract<RemoteWriteAuth, { type: 'sigv4' }>,
-): () => Promise<AwsCredentials> {
-  // Both providers cache and refresh by themselves.
-  return auth.roleArn
+function githubSource(
+  config: Config,
+  credentials: Cached<AppCredentials> | undefined,
+): GitHubSource | undefined {
+  if (!credentials) return undefined
+  const client = createGitHubAppClient({ credentials, fetch, userAgent: USER_AGENT, now: Date.now })
+  return {
+    isConfigured: async signal => (await credentials.get(signal)) !== undefined,
+    registeredRunners: (scopes, signal) =>
+      readRegisteredRunners(client, scopes, config.github.owners, signal),
+  }
+}
+
+/** Both providers cache and refresh by themselves. */
+const writerCredentials = (auth: SigV4Auth): (() => Promise<AwsCredentialIdentity>) =>
+  auth.roleArn
     ? fromTemporaryCredentials({
         params: {
           RoleArn: auth.roleArn,
-          RoleSessionName: 'github-runner-metrics',
+          RoleSessionName: auth.sessionName,
           DurationSeconds: 900,
           ...(auth.externalId ? { ExternalId: auth.externalId } : {}),
         },
         clientConfig: { region: auth.region },
       })
     : fromNodeProviderChain()
-}
 
 export function buildDeps(env: NodeJS.ProcessEnv): Deps {
   const config = parseConfig(env.CONFIG)
-  const region = env.AWS_REGION
-  const clientConfig = region ? { region } : {}
-  const sqs = new SQSClient(clientConfig)
-  const cloudwatch = new CloudWatchClient(clientConfig)
-  const ec2 = new EC2Client(clientConfig)
-  const secrets = secretReader(new SecretsManagerClient(clientConfig))
-  const ssm = new SSMClient(clientConfig)
-
-  const loadGitHubCredentials = githubCredentialsLoader(config, secrets, ssm)
-  const github = loadGitHubCredentials
-    ? createGitHubAppClient({
-        loadCredentials: loadGitHubCredentials,
-        fetch,
-        userAgent: USER_AGENT,
-        now: Date.now,
-      })
-    : undefined
+  const clientConfig = env.AWS_REGION ? { region: env.AWS_REGION } : {}
+  const sqs = sqsQueueAttributes(new SQSClient(clientConfig))
+  const cloudwatch = cloudWatchQueueAges(new CloudWatchClient(clientConfig))
+  const ec2 = ec2RunnerInstances(new EC2Client(clientConfig))
+  const readSecret = secretsManagerValue(new SecretsManagerClient(clientConfig))
+  const readParameter = ssmParameterValue(new SSMClient(clientConfig))
+  const { runnerConfigs } = config
 
   return {
     config,
@@ -136,110 +124,15 @@ export function buildDeps(env: NodeJS.ProcessEnv): Deps {
     log: jsonLogger,
     vanish: createVanishTracker(),
     sources: {
-      queueDepths: signal =>
-        readQueueDepths(
-          async (QueueUrl, abortSignal) =>
-            (
-              await sqs.send(
-                new GetQueueAttributesCommand({
-                  QueueUrl,
-                  AttributeNames: [
-                    'ApproximateNumberOfMessages',
-                    'ApproximateNumberOfMessagesNotVisible',
-                    'ApproximateNumberOfMessagesDelayed',
-                  ],
-                }),
-                { abortSignal },
-              )
-            ).Attributes ?? {},
-          config.runnerConfigs,
-          signal,
-        ),
-      queueAges: (now, signal) =>
-        readQueueAges(
-          async (queueNames, window, abortSignal) => {
-            const datapoints = new Map<string, number[]>()
-            // GetMetricData takes up to 500 queries a call.
-            for (let start = 0; start < queueNames.length; start += 500) {
-              const names = queueNames.slice(start, start + 500)
-              const queries: MetricDataQuery[] = names.map((name, i) => ({
-                Id: `q${start + i}`,
-                MetricStat: {
-                  Metric: {
-                    Namespace: 'AWS/SQS',
-                    MetricName: 'ApproximateAgeOfOldestMessage',
-                    Dimensions: [{ Name: 'QueueName', Value: name }],
-                  },
-                  Period: 60,
-                  Stat: 'Maximum',
-                },
-              }))
-              let NextToken: string | undefined
-              do {
-                const out = await cloudwatch.send(
-                  new GetMetricDataCommand({
-                    StartTime: window.start,
-                    EndTime: window.end,
-                    ScanBy: 'TimestampDescending',
-                    MetricDataQueries: queries,
-                    NextToken,
-                  }),
-                  { abortSignal },
-                )
-                for (const result of out.MetricDataResults ?? []) {
-                  const name = queueNames[Number(result.Id?.slice(1))]
-                  if (name)
-                    datapoints.set(name, [
-                      ...(datapoints.get(name) ?? []),
-                      ...(result.Values ?? []),
-                    ])
-                }
-                NextToken = out.NextToken
-              } while (NextToken)
-            }
-            return datapoints
-          },
-          config.runnerConfigs,
-          now,
-          signal,
-        ),
-      instances: signal =>
-        readInstances(
-          async (environments, abortSignal) => {
-            const instances: Instance[] = []
-            let NextToken: string | undefined
-            do {
-              const page = await ec2.send(
-                new DescribeInstancesCommand({
-                  Filters: [
-                    { Name: 'tag:ghr:Application', Values: ['github-action-runner'] },
-                    { Name: 'tag:ghr:environment', Values: [...environments] },
-                    { Name: 'instance-state-name', Values: ['pending', 'running'] },
-                  ],
-                  NextToken,
-                }),
-                { abortSignal },
-              )
-              for (const reservation of page.Reservations ?? [])
-                instances.push(...(reservation.Instances ?? []))
-              NextToken = page.NextToken
-            } while (NextToken)
-            return instances
-          },
-          config.runnerConfigs,
-          signal,
-        ),
-      registeredRunners: github
-        ? async (scopes, signal) =>
-            (await github.credentials(signal))
-              ? readRegisteredRunners(github, scopes, config.github.owners, signal)
-              : undefined
-        : undefined,
+      queueDepths: signal => readQueueDepths(sqs, runnerConfigs, signal),
+      queueAges: (now, signal) => readQueueAges(cloudwatch, runnerConfigs, now, signal),
+      instances: signal => readInstances(ec2, runnerConfigs, signal),
+      github: githubSource(config, githubCredentials(config, readSecret, readParameter)),
     },
     sink: remoteWriteSink({
       url: config.remoteWrite.url,
       auth: authFromConfig(config.remoteWrite.auth, {
-        readSecret: arn => secrets(arn),
+        secret: arn => cached(signal => readSecret(arn, signal), CREDENTIALS_TTL_MS, Date.now),
         credentialsFor: writerCredentials,
       }),
       headers: config.remoteWrite.headers,

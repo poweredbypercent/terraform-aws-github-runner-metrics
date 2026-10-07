@@ -1,11 +1,6 @@
 import { createSign } from 'node:crypto'
 
-/**
- * A GitHub App's identity. The recommended App is dedicated and read-only (organisation
- * "Self-hosted runners: Read", plus repository "Administration: Read" for repository-level
- * runners); the runner module's own App also works, but it can register runners, so it is more
- * access than reading them needs.
- */
+/** A GitHub App's identity: a dedicated read-only App, or the runner module's (see the README). */
 export interface AppCredentials {
   readonly appId: string
   readonly privateKey: string

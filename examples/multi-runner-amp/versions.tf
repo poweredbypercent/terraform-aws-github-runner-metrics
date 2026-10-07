@@ -5,8 +5,8 @@ terraform {
       source  = "hashicorp/aws"
       version = ">= 6.33"
     }
-    local = {
-      source  = "hashicorp/local"
+    external = {
+      source  = "hashicorp/external"
       version = ">= 2.2"
     }
     random = {

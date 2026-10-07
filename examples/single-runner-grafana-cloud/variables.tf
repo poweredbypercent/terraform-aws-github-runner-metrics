@@ -46,3 +46,8 @@ variable "lambda_object_version" {
   description = "The zip object's version, so a new upload is deployed."
   type        = string
 }
+
+variable "github_owners" {
+  description = "The organisations (or \"owner/repo\") the runners register in."
+  type        = list(string)
+}

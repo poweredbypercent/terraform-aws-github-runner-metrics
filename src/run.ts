@@ -1,19 +1,12 @@
 import type { Config } from './config/types.ts'
-import { type Result, settle } from './domain/result.ts'
-import type {
-  GitHubScope,
-  PartialResult,
-  QueueDepth,
-  RegisteredRunner,
-  RunnerInstance,
-  Snapshot,
-  SourceName,
-} from './domain/types.ts'
+import { err, type Result } from './domain/result.ts'
+import { settle } from './domain/settle.ts'
+import type { RunnerInstance, Snapshot, SourceName } from './domain/types.ts'
 import type { Logger } from './log.ts'
 import { METRICS, type Sample, sample } from './model/catalogue.ts'
 import { buildSeries } from './model/series.ts'
 import type { VanishTracker } from './model/vanish.ts'
-import type { Sink } from './sinks/remote-write/sink.ts'
+import type { GitHubSource, RegisteredRunners, Sink, Sources } from './ports.ts'
 
 /**
  * One sample of the runner stack: read every source, build the series, push them.
@@ -24,19 +17,6 @@ import type { Sink } from './sinks/remote-write/sink.ts'
  * itself is the one failure that fails the invocation.
  */
 
-export interface Sources {
-  queueDepths(signal: AbortSignal): Promise<PartialResult<string, QueueDepth>>
-  queueAges(now: number, signal: AbortSignal): Promise<ReadonlyMap<string, number>>
-  instances(signal: AbortSignal): Promise<readonly RunnerInstance[]>
-  /** undefined when GitHub is not configured, so it is not attempted at all. */
-  registeredRunners:
-    | ((
-        scopes: readonly GitHubScope[],
-        signal: AbortSignal,
-      ) => Promise<PartialResult<string, readonly RegisteredRunner[]> | undefined>)
-    | undefined
-}
-
 export interface Deps {
   readonly config: Config
   readonly sources: Sources
@@ -46,71 +26,112 @@ export interface Deps {
   readonly log: Logger
 }
 
+/** Which sources answered; a source that is not configured is absent. */
+export type SourceHealth = { readonly [S in SourceName]?: boolean }
+
 export interface Outcome {
   readonly series: number
-  readonly up: Snapshot['up']
+  readonly up: SourceHealth
 }
 
 export async function sampleOnce(deps: Deps): Promise<Outcome> {
-  const { config, sources, log } = deps
   const now = deps.now()
-  const budget = config.sourceTimeoutMs
+  const { snapshot, up } = await readSources(deps, now)
+  const proposed = deps.vanish.apply(buildSeries(deps.config, snapshot), up, now)
+  const series = finalise(deps.config, proposed.samples, up, now, deps.now())
+  await deps.sink.push(series)
+  proposed.commit()
+  deps.log('info', 'pushed', { series: series.length, up })
+  return { series: series.length, up }
+}
 
-  const depths = settle(budget, signal => sources.queueDepths(signal))
-  const ages = settle(budget, signal => sources.queueAges(now, signal))
+/** GitHub's answer: skipped when the App is not filled in yet, otherwise read or failed. */
+type GitHubRead = 'not-configured' | Result<RegisteredRunners>
+
+async function readSources(
+  deps: Deps,
+  now: number,
+): Promise<{ snapshot: Snapshot; up: SourceHealth }> {
+  const { sources, log } = deps
+  const budget = deps.config.sourceTimeoutMs
+
   const instances = settle(budget, signal => sources.instances(signal))
-  const runners = (async (): Promise<
-    Result<PartialResult<string, readonly RegisteredRunner[]> | undefined>
-  > => {
-    const read = sources.registeredRunners
-    if (!read) return { ok: true, value: undefined }
-    const known = await instances
-    const scopes = known.ok ? known.value.flatMap(i => (i.scope ? [i.scope] : [])) : []
-    return settle(budget, signal => read(scopes, signal))
-  })()
+  const [depths, ages, known, github] = await Promise.all([
+    settle(budget, signal => sources.queueDepths(signal)),
+    settle(budget, signal => sources.queueAges(now, signal)),
+    instances,
+    sources.github ? readGitHub(sources.github, instances, budget) : undefined,
+  ])
 
-  const [d, a, i, r] = await Promise.all([depths, ages, instances, runners])
   const up: { [S in SourceName]?: boolean } = {
-    sqs: d.ok && d.value.failed.length === 0,
-    cloudwatch: a.ok,
-    ec2: i.ok,
+    sqs: depths.ok && depths.value.failed.length === 0,
+    cloudwatch: ages.ok,
+    ec2: known.ok,
   }
-  const githubConfigured = !r.ok || r.value !== undefined
-  if (githubConfigured) up.github = r.ok && r.value !== undefined && r.value.failed.length === 0
+  const runners = github === 'not-configured' ? undefined : github
+  if (runners) up.github = runners.ok && runners.value.failed.length === 0
 
   for (const [source, result] of [
-    ['sqs', d],
-    ['cloudwatch', a],
-    ['ec2', i],
-    ['github', r],
+    ['sqs', depths],
+    ['cloudwatch', ages],
+    ['ec2', known],
+    ['github', runners],
   ] as const) {
-    if (!result.ok) log('warn', 'source failed', { source, error: result.error })
+    if (result && !result.ok) log('warn', 'source failed', { source, error: result.error })
   }
-  if (d.ok && d.value.failed.length > 0) log('warn', 'queues not read', { queues: d.value.failed })
-  if (r.ok && r.value && r.value.failed.length > 0) {
-    log('warn', 'GitHub scopes not read', { scopes: r.value.failed })
+  if (depths.ok && depths.value.failed.length > 0) {
+    log('warn', 'queues not read', { queues: depths.value.failed })
+  }
+  if (runners?.ok && runners.value.failed.length > 0) {
+    log('warn', 'GitHub scopes not read', { scopes: runners.value.failed })
+  }
+  if (github === 'not-configured') {
+    log('warn', 'GitHub skipped: the App credentials have not been filled in yet')
   }
 
-  const snapshot: Snapshot = {
-    now,
-    depths: d.ok ? d.value : undefined,
-    ages: a.ok ? a.value : undefined,
-    instances: i.ok ? i.value : undefined,
-    runners: r.ok ? r.value : undefined,
+  return {
+    snapshot: {
+      now,
+      depths: depths.ok ? depths.value : undefined,
+      ages: ages.ok ? ages.value : undefined,
+      instances: known.ok ? known.value : undefined,
+      runners: runners?.ok ? runners.value : undefined,
+    },
     up,
   }
-  const series: Sample[] = deps.vanish.apply(buildSeries(config, snapshot), up, now)
-  for (const [source, ok] of Object.entries(up)) {
-    series.push(sample(METRICS.sourceUp, { source }, ok ? 1 : 0, now))
-  }
-  series.push(
-    sample(METRICS.sampleDuration, {}, (deps.now() - now) / 1000, now),
-    sample(METRICS.lastSampleTimestamp, {}, now / 1000, now),
-  )
-  // The global constant labels go on every series, the sampler's own included.
-  const labelled = series.map(s => ({ ...s, labels: { ...config.labels, ...s.labels } }))
+}
 
-  await deps.sink.push(labelled)
-  log('info', 'pushed', { series: labelled.length, up })
-  return { series: labelled.length, up }
+async function readGitHub(
+  github: GitHubSource,
+  instances: Promise<Result<readonly RunnerInstance[]>>,
+  budget: number,
+): Promise<GitHubRead> {
+  const configured = await settle(budget, signal => github.isConfigured(signal))
+  if (!configured.ok) return err(configured.error)
+  if (!configured.value) return 'not-configured'
+  const known = await instances
+  // Without the instances there is nothing to ask about; reading no scopes would look like a
+  // healthy GitHub reporting no runners at all.
+  if (!known.ok) return err(`needs ec2, which failed: ${known.error}`)
+  const scopes = known.value.flatMap(i => (i.scope ? [i.scope] : []))
+  return settle(budget, signal => github.registeredRunners(scopes, signal))
+}
+
+/** The sampler's own series, and the global constant labels on every series. */
+function finalise(
+  config: Config,
+  samples: readonly Sample[],
+  up: SourceHealth,
+  now: number,
+  finished: number,
+): Sample[] {
+  const series = [
+    ...samples,
+    ...Object.entries(up).map(([source, answered]) =>
+      sample(METRICS.sourceUp, { source }, answered ? 1 : 0, now),
+    ),
+    sample(METRICS.sampleDuration, {}, (finished - now) / 1000, now),
+    sample(METRICS.lastSampleTimestamp, {}, now / 1000, now),
+  ]
+  return series.map(s => ({ ...s, labels: { ...config.labels, ...s.labels } }))
 }

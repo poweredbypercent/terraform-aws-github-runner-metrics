@@ -1,4 +1,5 @@
 import { invalidLabelName } from '../domain/labels.ts'
+import { err, ok, type Result } from '../domain/result.ts'
 import type { QueueKind, QueueRef } from '../domain/types.ts'
 import type {
   Config,
@@ -83,9 +84,9 @@ class Reader {
 }
 
 const ARN_SQS = /^arn:(aws[a-z-]*):sqs:([a-z0-9-]+):(\d{12}):([A-Za-z0-9_-]{1,80})$/
-const ARN_SECRET = /^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$/
-const ARN_ROLE = /^arn:aws[a-z-]*:iam::\d{12}:role\/.+$/
-const HTTP_URL = /^https?:\/\/[^\s/]+(\/\S*)?$/
+/** One secret, never a wildcard: the role's grant is scoped to exactly what is named here. */
+const ARN_SECRET = /^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:\d{12}:secret:[A-Za-z0-9/_+=.@-]+$/
+const ARN_ROLE = /^arn:aws[a-z-]*:iam::\d{12}:role\/[A-Za-z0-9/_+=,.@-]+$/
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
 const RESERVED_HEADERS = [
   'authorization',
@@ -104,14 +105,38 @@ const DNS_SUFFIX: Record<string, string> = {
   'aws-cn': 'amazonaws.com.cn',
 }
 
-export function queueFromArn(arn: string): QueueRef | string {
+export function queueFromArn(arn: string): Result<QueueRef> {
   const match = arn.match(ARN_SQS)
-  if (!match) return `${arn} is not an SQS queue ARN`
+  if (!match) return err(`${arn} is not an SQS queue ARN`)
   const [, partition = '', region = '', account = '', name = ''] = match
   const suffix = DNS_SUFFIX[partition]
-  if (!suffix) return `${arn} is in partition ${partition}, which is not supported`
+  if (!suffix) return err(`${arn} is in partition ${partition}, which is not supported`)
   const kind: QueueKind = name.endsWith('_dead_letter') ? 'dead_letter' : 'main'
-  return { arn, name, url: `https://sqs.${region}.${suffix}/${account}/${name}`, kind }
+  return ok({ arn, name, url: `https://sqs.${region}.${suffix}/${account}/${name}`, kind })
+}
+
+/**
+ * An endpoint URL, without credentials or a query string in it: those would end up in logs and
+ * error messages. https is required wherever a credential travels; plain http stays possible for
+ * an unauthenticated receiver on a private network (and for the end-to-end test).
+ */
+function endpointUrl(r: Reader, value: Json, at: string, requireHttps: boolean): string {
+  const text = r.string(value, at)
+  if (!text) return ''
+  let url: URL
+  try {
+    url = new URL(text)
+  } catch {
+    r.problems.push(`${at} must be an absolute URL`)
+    return ''
+  }
+  const allowed = requireHttps ? ['https:'] : ['https:', 'http:']
+  if (!allowed.includes(url.protocol)) {
+    r.problems.push(`${at} must use ${requireHttps ? 'https' : 'http or https'}`)
+  }
+  if (url.username || url.password) r.problems.push(`${at} must not contain credentials`)
+  if (url.search || url.hash) r.problems.push(`${at} must not contain a query string or fragment`)
+  return text.replace(/\/+$/, '')
 }
 
 function runnerConfig(r: Reader, value: Json, at: string): RunnerConfig {
@@ -119,8 +144,8 @@ function runnerConfig(r: Reader, value: Json, at: string): RunnerConfig {
   const queues: QueueRef[] = []
   for (const [i, arn] of r.array(o.queue_arns, `${at}.queue_arns`).entries()) {
     const queue = queueFromArn(r.string(arn, `${at}.queue_arns[${i}]`))
-    if (typeof queue === 'string') r.problems.push(`${at}.queue_arns[${i}]: ${queue}`)
-    else queues.push(queue)
+    if (queue.ok) queues.push(queue.value)
+    else r.problems.push(`${at}.queue_arns[${i}]: ${queue.error}`)
   }
   const max = o.max_runners
   return {
@@ -131,9 +156,13 @@ function runnerConfig(r: Reader, value: Json, at: string): RunnerConfig {
         ? null
         : r.number(max, `${at}.max_runners`, 0, 100_000),
     runnerNamePrefix: typeof o.runner_name_prefix === 'string' ? o.runner_name_prefix : '',
-    githubApiUrl: r
-      .string(o.github_api_url ?? 'https://api.github.com', `${at}.github_api_url`, HTTP_URL)
-      .replace(/\/+$/, ''),
+    // Always https: the App's installation tokens are sent there.
+    githubApiUrl: endpointUrl(
+      r,
+      o.github_api_url ?? 'https://api.github.com',
+      `${at}.github_api_url`,
+      true,
+    ),
     queues,
     labels: r.stringMap(o.labels, `${at}.labels`, invalidLabelName),
   }
@@ -173,6 +202,12 @@ function remoteWriteAuth(r: Reader, value: Json, at: string): RemoteWriteAuth {
         service: r.string(o.service ?? 'aps', `${at}.service`),
         roleArn,
         externalId,
+        // STS: 2-64 characters of [\w+=,.@-].
+        sessionName: r.string(
+          o.session_name ?? 'github-runner-metrics',
+          `${at}.session_name`,
+          /^[\w+=,.@-]{2,64}$/,
+        ),
       }
     }
     case 'basic':
@@ -186,9 +221,10 @@ function remoteWriteAuth(r: Reader, value: Json, at: string): RemoteWriteAuth {
 
 function remoteWrite(r: Reader, value: Json, at: string): RemoteWriteConfig {
   const o = r.object(value, at)
+  const auth = remoteWriteAuth(r, o.auth, `${at}.auth`)
   return {
-    url: r.string(o.url, `${at}.url`, HTTP_URL),
-    auth: remoteWriteAuth(r, o.auth, `${at}.auth`),
+    url: endpointUrl(r, o.url, `${at}.url`, auth.type !== 'none'),
+    auth,
     headers: r.stringMap(o.headers, `${at}.headers`, name =>
       !HEADER_NAME.test(name)
         ? 'is not a valid header name'

@@ -5,12 +5,9 @@ data "aws_iam_policy_document" "assume" {
       type        = "Service"
       identifiers = ["lambda.amazonaws.com"]
     }
-    # Only Lambda acting for this account may assume the role.
-    condition {
-      test     = "StringEquals"
-      variable = "aws:SourceAccount"
-      values   = [local.account]
-    }
+    # No aws:SourceAccount / aws:SourceArn condition: Lambda does not document setting them when it
+    # assumes an execution role, and a condition it does not satisfy leaves the function unable to
+    # start. Giving a function this role needs iam:PassRole on it in this account.
   }
 }
 
@@ -25,10 +22,10 @@ resource "aws_iam_role" "lambda" {
 locals {
   secret_arns = compact([local.github_secret_arn, local.remote_write_secret_arn])
   ssm_parameter_arns = local.github_ssm_parameters == null ? [] : [
-    for name in values(local.github_ssm_parameters) :
+    for name in compact(values(local.github_ssm_parameters)) :
     "arn:${local.partition}:ssm:${local.region}:${local.account}:parameter/${trimprefix(name, "/")}"
   ]
-  kms_key_arns = distinct(compact(concat([var.kms_key_arn, var.github_app.kms_key_arn], var.secrets_kms_key_arns)))
+  kms_key_arns = distinct(compact(concat([var.kms_key_arn], var.secrets_kms_key_arns)))
 }
 
 # Least privilege, generated from the inputs: a statement exists only when its feature is used.
@@ -39,10 +36,14 @@ data "aws_iam_policy_document" "lambda" {
     resources = ["${aws_cloudwatch_log_group.lambda.arn}:*"]
   }
 
-  statement {
-    sid       = "AllowReadQueueDepth"
-    actions   = ["sqs:GetQueueAttributes"]
-    resources = local.queue_arns
+  # An empty resource list is an invalid policy; checks.tf reports the missing runner configs.
+  dynamic "statement" {
+    for_each = length(local.queue_arns) > 0 ? [1] : []
+    content {
+      sid       = "AllowReadQueueDepth"
+      actions   = ["sqs:GetQueueAttributes"]
+      resources = local.queue_arns
+    }
   }
 
   statement {
@@ -76,6 +77,15 @@ data "aws_iam_policy_document" "lambda" {
       sid       = "AllowDecrypt"
       actions   = ["kms:Decrypt"]
       resources = local.kms_key_arns
+      # Only for what Secrets Manager and SSM hand back, not any ciphertext under a shared key.
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values = [
+          "secretsmanager.${local.region}.${local.dns_suffix}",
+          "ssm.${local.region}.${local.dns_suffix}",
+        ]
+      }
     }
   }
 

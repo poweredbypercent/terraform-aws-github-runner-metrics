@@ -12,15 +12,17 @@
 import { createHash } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { build } from 'esbuild'
 import { deterministicZip } from './zip.ts'
 
-const root = new URL('..', import.meta.url).pathname
+const root = fileURLToPath(new URL('..', import.meta.url))
 const outdir = join(root, 'dist', 'lambda')
 const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
   version: string
 }
-export const ZIP_NAME = 'terraform-aws-github-runner-metrics.zip'
+/** modules/download-lambda/download.sh fetches the release asset by this name. */
+const ZIP_NAME = 'terraform-aws-github-runner-metrics.zip'
 
 /**
  * The licence of every package the bundle includes, as redistributing them requires (the AWS SDK
@@ -95,7 +97,7 @@ export function zip(): { file: string; sha256: string } {
   return { file, sha256 }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
   await bundle()
   if (process.argv.includes('--zip')) {
     const { file, sha256 } = zip()

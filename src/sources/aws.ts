@@ -1,6 +1,7 @@
 import type { Instance } from '@aws-sdk/client-ec2'
 import type { RunnerConfig } from '../config/types.ts'
 import { scopeFromTags } from '../domain/scope.ts'
+import { readEach } from '../domain/settle.ts'
 import type { PartialResult, QueueDepth, QueueRef, RunnerInstance } from '../domain/types.ts'
 
 /**
@@ -30,42 +31,39 @@ const allQueues = (configs: readonly RunnerConfig[]): QueueRef[] => configs.flat
 
 /**
  * Depth of every configured queue. Each queue is read on its own, so one that cannot be read (a
- * dead-letter queue that was never created, a permission missing) fails alone.
+ * permission missing) fails alone.
  */
 export async function readQueueDepths(
   getAttributes: GetQueueAttributes,
   configs: readonly RunnerConfig[],
   signal: AbortSignal,
-): Promise<PartialResult<string, QueueDepth>> {
-  const values = new Map<string, QueueDepth>()
-  const failed: string[] = []
-  await Promise.all(
-    allQueues(configs).map(async queue => {
+): Promise<PartialResult<QueueDepth>> {
+  return readEach(
+    allQueues(configs),
+    queue => queue.arn,
+    async queue => {
       try {
         const a = await getAttributes(queue.url, signal)
-        values.set(queue.arn, {
+        return {
           visible: Number(a.ApproximateNumberOfMessages ?? 0),
           inFlight: Number(a.ApproximateNumberOfMessagesNotVisible ?? 0),
           delayed: Number(a.ApproximateNumberOfMessagesDelayed ?? 0),
-        })
-      } catch (err) {
+        }
+      } catch (error) {
         // A runner config without redrive_build_queue has no dead-letter queue. Its ARN is still
         // derived from the naming convention (multi-runner stacks do not output their queues),
         // so a missing one is absent, not a failure.
-        if (queue.kind === 'dead_letter' && isNonExistentQueue(err)) return
-        failed.push(queue.arn)
+        if (queue.kind === 'dead_letter' && isNonExistentQueue(error)) return undefined
+        throw error
       }
-    }),
+    },
   )
-  if (failed.length > 0 && values.size === 0)
-    throw new Error(`no queue could be read (${failed.length})`)
-  return { values, failed }
 }
 
-const isNonExistentQueue = (err: unknown): boolean =>
-  err instanceof Error &&
+const isNonExistentQueue = (error: unknown): boolean =>
+  error instanceof Error &&
   /NonExistentQueue|QueueDoesNotExist/.test(
-    `${err.name} ${(err as { Code?: string }).Code ?? ''} ${err.message}`,
+    `${error.name} ${(error as { Code?: string }).Code ?? ''} ${error.message}`,
   )
 
 /**

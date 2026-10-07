@@ -1,41 +1,33 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { parseConfig } from '../config/parse.ts'
 import { scopeKey } from '../domain/scope.ts'
 import type { GitHubScope, RegisteredRunner, RunnerInstance, Snapshot } from '../domain/types.ts'
-import type { Sample } from './catalogue.ts'
+import { queueArn as ARN, NOW, ORG, testConfig } from '../test/fixtures.ts'
+import { PREFIX, type Sample } from './catalogue.ts'
 import { buildSeries } from './series.ts'
 
-const NOW = Date.parse('2026-10-07T12:00:00Z')
-const API = 'https://api.github.com'
-const ARN = (name: string) => `arn:aws:sqs:eu-west-1:123456789012:${name}`
-const ORG: GitHubScope = { type: 'org', owner: 'acme', apiUrl: API }
-const REPO: GitHubScope = { type: 'repo', owner: 'acme', repo: 'widgets', apiUrl: API }
+const REPO: GitHubScope = { type: 'repo', owner: 'acme', repo: 'widgets', apiUrl: ORG.apiUrl }
 
-const config = parseConfig(
-  JSON.stringify({
-    version: 1,
-    runner_configs: [
-      {
-        name: 'linux',
-        environment: 'ci-linux',
-        max_runners: 64,
-        runner_name_prefix: 'linux',
-        queue_arns: [ARN('ci-linux-queued-builds'), ARN('ci-linux-queued-builds_dead_letter')],
-        labels: { team: 'platform' },
-      },
-      {
-        name: 'gpu',
-        environment: 'ci-gpu',
-        max_runners: -1,
-        runner_name_prefix: 'gpu',
-        queue_arns: [ARN('ci-gpu-queued-builds')],
-      },
-    ],
-    remote_write: { url: 'http://localhost:9090/api/v1/write' },
-    labels: { stack: 'ci' },
-  }),
-)
+const config = testConfig({
+  runner_configs: [
+    {
+      name: 'linux',
+      environment: 'ci-linux',
+      max_runners: 64,
+      runner_name_prefix: 'linux',
+      queue_arns: [ARN('ci-linux-queued-builds'), ARN('ci-linux-queued-builds_dead_letter')],
+      labels: { team: 'platform' },
+    },
+    {
+      name: 'gpu',
+      environment: 'ci-gpu',
+      max_runners: -1,
+      runner_name_prefix: 'gpu',
+      queue_arns: [ARN('ci-gpu-queued-builds')],
+    },
+  ],
+  labels: { stack: 'ci' },
+})
 
 const instance = (id: string, overrides: Partial<RunnerInstance> = {}): RunnerInstance => ({
   id,
@@ -63,15 +55,13 @@ const snapshot = (overrides: Partial<Snapshot> = {}): Snapshot => ({
   ages: undefined,
   instances: undefined,
   runners: undefined,
-  up: {},
   ...overrides,
 })
 
 const find = (series: readonly Sample[], name: string, labels: Record<string, string> = {}) =>
   series.filter(
     s =>
-      s.name === `github_aws_runners_${name}` &&
-      Object.entries(labels).every(([k, v]) => s.labels[k] === v),
+      s.name === `${PREFIX}${name}` && Object.entries(labels).every(([k, v]) => s.labels[k] === v),
   )
 const value = (series: readonly Sample[], name: string, labels: Record<string, string> = {}) => {
   const matches = find(series, name, labels)

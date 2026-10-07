@@ -1,3 +1,6 @@
+import { describeError } from '../domain/result.ts'
+import type { Fetch } from '../http.ts'
+
 /**
  * One HTTP POST with the remote-write retry rules:
  *
@@ -9,10 +12,28 @@
  * Failures throw, so the invocation counts as failed in the Lambda's own metrics.
  */
 
-export type Fetch = typeof fetch
-
 export class PushError extends Error {
   override readonly name = 'PushError'
+  /** The receiver's HTTP status; undefined when it never answered. */
+  readonly status: number | undefined
+  constructor(message: string, status?: number) {
+    super(message)
+    this.status = status
+  }
+}
+
+/**
+ * Only a 400's body is kept: it says which samples were rejected and why ("out of order sample").
+ * Any other body may be a proxy's page echoing the request, Authorization header included, so it
+ * is not logged.
+ */
+async function explain(response: Response): Promise<string> {
+  if (response.status !== 400) return ''
+  const body = await response.text().catch(() => '')
+  return ` ${body
+    .replace(/[^\x20-\x7e]+/g, ' ')
+    .trim()
+    .slice(0, 300)}`.trimEnd()
 }
 
 export async function post(
@@ -22,25 +43,26 @@ export async function post(
 ): Promise<void> {
   const deadline = Date.now() + request.timeoutMs
   for (let attempt = 1; ; attempt++) {
-    const remaining = deadline - Date.now()
-    let failure: string
+    let failure: PushError
+    let retryable: boolean
     try {
       const response = await fetchImpl(request.url, {
         method: 'POST',
         headers: request.headers,
         body: request.body,
-        signal: AbortSignal.timeout(Math.max(remaining, 1)),
+        signal: AbortSignal.timeout(Math.max(deadline - Date.now(), 1)),
       })
       if (response.ok) return
-      // The body explains rejections ("out of order sample"); cap it, it can echo the request.
-      const detail = (await response.text().catch(() => '')).slice(0, 300)
-      failure = `remote_write: ${response.status}${detail ? ` ${detail}` : ''}`
-      if (response.status < 500) throw new PushError(failure)
+      failure = new PushError(
+        `remote_write: ${response.status}${await explain(response)}`,
+        response.status,
+      )
+      retryable = response.status >= 500
     } catch (err) {
-      if (err instanceof PushError) throw err
-      failure = `remote_write: ${err instanceof Error ? err.message : String(err)}`
+      failure = new PushError(`remote_write: ${describeError(err)}`)
+      retryable = true
     }
-    if (attempt >= 2 || deadline - Date.now() <= retryDelayMs) throw new PushError(failure)
+    if (!retryable || attempt >= 2 || deadline - Date.now() <= retryDelayMs) throw failure
     await new Promise(resolve => setTimeout(resolve, retryDelayMs))
   }
 }

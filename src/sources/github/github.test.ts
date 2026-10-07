@@ -1,18 +1,23 @@
 import assert from 'node:assert/strict'
 import { createVerify, generateKeyPairSync } from 'node:crypto'
 import { describe, it } from 'node:test'
+import { cached } from '../../cache.ts'
 import { scopeKey } from '../../domain/scope.ts'
 import type { GitHubScope } from '../../domain/types.ts'
-import type { Fetch } from '../../sinks/transport.ts'
-import { createGitHubAppClient } from './client.ts'
-import { credentialsFromRunnerModule, mintJwt, parseAppSecret } from './credentials.ts'
+import type { Fetch } from '../../http.ts'
+import { NOW, ORG, signal } from '../../test/fixtures.ts'
+import { createGitHubAppClient, type GitHubAppClient } from './client.ts'
+import {
+  type AppCredentials,
+  credentialsFromRunnerModule,
+  mintJwt,
+  parseAppSecret,
+} from './credentials.ts'
 import { readRegisteredRunners } from './runners.ts'
 
-const NOW = Date.parse('2026-10-07T12:00:00Z')
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
 const PEM = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
-const APP = { appId: '123', privateKey: PEM }
-const ORG: GitHubScope = { type: 'org', owner: 'acme', apiUrl: 'https://api.github.com' }
+const APP: AppCredentials = { appId: '123', privateKey: PEM }
 const REPO: GitHubScope = {
   type: 'repo',
   owner: 'acme',
@@ -47,12 +52,16 @@ describe('credentials', () => {
   })
 })
 
-/** A fake GitHub: installations, token minting and runner pages, recording every call. */
+/**
+ * A fake GitHub: installations, token minting and runner pages, recording every call. `refuse`
+ * makes the next call to a path ending in the given suffix answer with a status instead.
+ */
 function fakeGitHub(
   pages: Record<string, { name: string; status: string; busy: boolean }[][]> = {},
 ) {
   const calls: { method: string; url: string; body?: unknown }[] = []
-  let rejectNextRunnersCall = false
+  const refusals: { suffix: string; status: number }[] = []
+  let installationId = 1
   let tokens = 0
   const fetchImpl: Fetch = async (input, init) => {
     const url = new URL(String(input))
@@ -63,44 +72,64 @@ function fakeGitHub(
       body: init?.body && JSON.parse(String(init.body)),
     })
     const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status })
-    if (url.pathname.endsWith('/installation'))
-      return json({ id: url.pathname.includes('/repos/') ? 2 : 1 })
+    const refusal = refusals.findIndex(r => url.pathname.endsWith(r.suffix))
+    if (refusal >= 0) return json({}, refusals.splice(refusal, 1)[0]?.status)
+    if (url.pathname.endsWith('/installation')) {
+      return json({ id: url.pathname.includes('/repos/') ? 100 + installationId : installationId })
+    }
     if (url.pathname.endsWith('/access_tokens')) {
       tokens++
       return json({ token: `t${tokens}`, expires_at: new Date(NOW + 3_600_000).toISOString() })
     }
     if (url.pathname.endsWith('/actions/runners')) {
-      if (rejectNextRunnersCall) {
-        rejectNextRunnersCall = false
-        return json({}, 401)
-      }
       const page = Number(url.searchParams.get('page'))
       return json({ runners: pages[url.pathname]?.[page - 1] ?? [] })
     }
     return json({}, 404)
   }
-  return { calls, fetchImpl, rejectNext: () => (rejectNextRunnersCall = true) }
+  const count = (suffix: string) => calls.filter(call => call.url.endsWith(suffix)).length
+  return {
+    calls,
+    fetchImpl,
+    count,
+    refuse: (suffix: string, status: number) => void refusals.push({ suffix, status }),
+    reinstall: () => void installationId++,
+  }
 }
 
-const client = (fetchImpl: Fetch, load = async () => APP as typeof APP | undefined) => {
+/** A client over a fake GitHub, with a clock to move and credentials that count their loads. */
+function harness(load: () => AppCredentials | undefined = () => APP) {
   let now = NOW
-  const c = createGitHubAppClient({
-    loadCredentials: load,
-    fetch: fetchImpl,
+  let loads = 0
+  const github = fakeGitHub()
+  const credentials = cached(
+    async () => {
+      loads++
+      return load()
+    },
+    10 * 60_000,
+    () => now,
+  )
+  const client = createGitHubAppClient({
+    credentials,
+    fetch: github.fetchImpl,
     userAgent: 'test',
     now: () => now,
   })
-  return { c, advance: (ms: number) => (now += ms) }
+  const advance = (ms: number) => {
+    now += ms
+  }
+  return { client, github, advance, loads: () => loads }
 }
-const signal = new AbortController().signal
+
+const RUNNERS = '/orgs/acme/actions/runners'
 
 describe('GitHub App client', () => {
   it('finds the installation and mints a token narrowed to the scope', async () => {
-    const gh = fakeGitHub()
-    const { c } = client(gh.fetchImpl)
-    await c.get(ORG, '/orgs/acme/actions/runners?per_page=100&page=1', signal)
-    await c.get(REPO, '/repos/acme/widgets/actions/runners?per_page=100&page=1', signal)
-    const minted = gh.calls.filter(call => call.url.endsWith('/access_tokens'))
+    const { client, github } = harness()
+    await client.get(ORG, RUNNERS, signal)
+    await client.get(REPO, '/repos/acme/widgets/actions/runners', signal)
+    const minted = github.calls.filter(call => call.url.endsWith('/access_tokens'))
     assert.deepEqual(
       minted.map(call => [call.url, call.body]),
       [
@@ -109,7 +138,7 @@ describe('GitHub App client', () => {
           { permissions: { organization_self_hosted_runners: 'read' } },
         ],
         [
-          'https://ghes.example/api/v3/app/installations/2/access_tokens',
+          'https://ghes.example/api/v3/app/installations/101/access_tokens',
           { repositories: ['widgets'], permissions: { administration: 'read' } },
         ],
       ],
@@ -117,40 +146,66 @@ describe('GitHub App client', () => {
   })
 
   it('reuses a token until it nears expiry', async () => {
-    const gh = fakeGitHub()
-    const { c, advance } = client(gh.fetchImpl)
-    await c.get(ORG, '/orgs/acme/actions/runners', signal)
+    const { client, github, advance } = harness()
+    await client.get(ORG, RUNNERS, signal)
     advance(60_000)
-    await c.get(ORG, '/orgs/acme/actions/runners', signal)
-    assert.equal(gh.calls.filter(call => call.url.endsWith('/access_tokens')).length, 1)
+    await client.get(ORG, RUNNERS, signal)
+    assert.equal(github.count('/access_tokens'), 1)
     advance(56 * 60_000)
-    await c.get(ORG, '/orgs/acme/actions/runners', signal)
-    assert.equal(gh.calls.filter(call => call.url.endsWith('/access_tokens')).length, 2)
+    await client.get(ORG, RUNNERS, signal)
+    assert.equal(github.count('/access_tokens'), 2)
   })
 
   it('mints once more when GitHub rejects the cached token', async () => {
-    const gh = fakeGitHub()
-    const { c } = client(gh.fetchImpl)
-    await c.get(ORG, '/orgs/acme/actions/runners', signal)
-    gh.rejectNext()
-    await c.get(ORG, '/orgs/acme/actions/runners', signal)
-    assert.equal(gh.calls.filter(call => call.url.endsWith('/access_tokens')).length, 2)
+    const { client, github } = harness()
+    await client.get(ORG, RUNNERS, signal)
+    github.refuse('/actions/runners', 401)
+    await client.get(ORG, RUNNERS, signal)
+    assert.equal(github.count('/access_tokens'), 2)
   })
 
   it('starts again with a rotated key at the next mint', async () => {
-    const gh = fakeGitHub()
     let key = PEM
-    const { c, advance } = client(gh.fetchImpl, async () => ({ appId: '123', privateKey: key }))
-    await c.get(ORG, '/orgs/acme/actions/runners', signal)
+    const { client, github, advance } = harness(() => ({ appId: '123', privateKey: key }))
+    await client.get(ORG, RUNNERS, signal)
     key = `${PEM}\n`
     // Tokens outlive a key rotation, so the cached one is used until it nears expiry...
     advance(11 * 60_000)
-    await c.get(ORG, '/orgs/acme/actions/runners', signal)
-    assert.equal(gh.calls.filter(call => call.url.endsWith('/installation')).length, 1)
+    await client.get(ORG, RUNNERS, signal)
+    assert.equal(github.count('/installation'), 1)
     // ...and the next mint, with the new key, looks the installation up afresh.
     advance(45 * 60_000)
-    await c.get(ORG, '/orgs/acme/actions/runners', signal)
-    assert.equal(gh.calls.filter(call => call.url.endsWith('/installation')).length, 2)
+    await client.get(ORG, RUNNERS, signal)
+    assert.equal(github.count('/installation'), 2)
+  })
+
+  it('reads the credentials again as soon as GitHub refuses the App, and retries once', async () => {
+    const { client, github, loads } = harness()
+    github.refuse('/installation', 401)
+    await client.get(ORG, RUNNERS, signal)
+    assert.equal(loads(), 2, 'not served from the ten-minute cache')
+    github.refuse('/installation', 401)
+    github.refuse('/installation', 401)
+    await assert.rejects(client.get(REPO, '/repos/acme/widgets/actions/runners', signal), /401/)
+  })
+
+  it('looks the installation up again when the App was reinstalled', async () => {
+    const { client, github, advance } = harness()
+    await client.get(ORG, RUNNERS, signal)
+    github.reinstall()
+    github.refuse('/installations/1/access_tokens', 404)
+    advance(56 * 60_000)
+    await client.get(ORG, RUNNERS, signal)
+    assert.equal(
+      github.calls.at(-2)?.url,
+      'https://api.github.com/app/installations/2/access_tokens',
+    )
+  })
+
+  it('refuses to call GitHub without credentials', async () => {
+    const { client, github } = harness(() => undefined)
+    await assert.rejects(client.get(ORG, RUNNERS, signal), /not configured/)
+    assert.equal(github.calls.length, 0)
   })
 })
 
@@ -161,25 +216,37 @@ describe('readRegisteredRunners', () => {
       status: 'online',
       busy: false,
     }))
-    const gh = fakeGitHub({
-      '/orgs/acme/actions/runners': [full, [{ name: 'last', status: 'offline', busy: false }]],
+    const github = fakeGitHub({
+      [RUNNERS]: [full, [{ name: 'last', status: 'offline', busy: false }]],
     })
-    const { c } = client(gh.fetchImpl)
+    const client = createGitHubAppClient({
+      credentials: cached(
+        async () => APP,
+        60_000,
+        () => NOW,
+      ),
+      fetch: github.fetchImpl,
+      userAgent: 'test',
+      now: () => NOW,
+    })
     const missing: GitHubScope = { type: 'org', owner: 'nope', apiUrl: 'https://api.github.com' }
-    const failingClient = {
-      get: (scope: GitHubScope, path: string, s: AbortSignal) =>
-        scope.owner === 'nope' ? Promise.reject(new Error('404')) : c.get(scope, path, s),
-    }
-    const result = await readRegisteredRunners(failingClient, [ORG, ORG, missing], [], signal)
+    github.refuse('/orgs/nope/installation', 404)
+    const result = await readRegisteredRunners(client, [ORG, ORG, missing], [], signal)
     assert.equal(result.values.get(scopeKey(ORG))?.length, 101)
     assert.equal(result.values.get(scopeKey(ORG))?.[100]?.status, 'offline')
     assert.deepEqual(result.failed, [scopeKey(missing)])
   })
 
   it('queries only the allowed owners when an allowlist is set', async () => {
-    const gh = fakeGitHub()
-    const { c } = client(gh.fetchImpl)
-    const result = await readRegisteredRunners(c, [ORG, REPO], ['acme/widgets'], signal)
+    const asked: GitHubScope[] = []
+    const client: GitHubAppClient = {
+      get: async scope => {
+        asked.push(scope)
+        return { runners: [] }
+      },
+    }
+    const result = await readRegisteredRunners(client, [ORG, REPO], ['acme/widgets'], signal)
     assert.deepEqual([...result.values.keys()], [scopeKey(REPO)])
+    assert.deepEqual(asked, [REPO])
   })
 })

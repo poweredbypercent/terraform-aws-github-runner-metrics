@@ -33,6 +33,11 @@ variable "runner_stacks" {
     condition     = alltrue([for s in var.runner_stacks : s.queues == null || s.runners != null])
     error_message = "runner_stacks[].queues goes with runners (the root module), not with multi_runner."
   }
+
+  validation {
+    condition     = alltrue([for s in var.runner_stacks : s.name == null || can(regex("^[A-Za-z0-9_.-]+$", s.name))])
+    error_message = "runner_stacks[].name may contain only letters, digits, '.', '-' and '_'."
+  }
 }
 
 variable "runner_configs" {
@@ -53,8 +58,22 @@ variable "runner_configs" {
   default = {}
 
   validation {
+    condition     = alltrue([for name in keys(var.runner_configs) : can(regex("^[A-Za-z0-9_.-]+$", name))])
+    error_message = "runner_configs keys may contain only letters, digits, '.', '-' and '_'."
+  }
+
+  validation {
     condition     = alltrue([for c in values(var.runner_configs) : can(regex("^[A-Za-z0-9_-]+$", c.environment))])
     error_message = "runner_configs[].environment may contain only letters, digits, '-' and '_' (it names the queues)."
+  }
+
+  validation {
+    # The App's tokens are sent there.
+    condition = alltrue([
+      for c in values(var.runner_configs) :
+      c.github_api_url == null || can(regex("^https://[^\\s/@?#]+(/[^\\s?#]*)?$", c.github_api_url))
+    ])
+    error_message = "runner_configs[].github_api_url must be an https:// URL without credentials or a query string."
   }
 }
 
@@ -90,13 +109,17 @@ variable "github_app" {
       disabled          no GitHub: queue, instance and capacity metrics only.
 
     The recommended App is dedicated and read-only: organisation "Self-hosted runners: Read", plus
-    repository "Administration: Read" for repository-level runners. `owners` limits which
-    organisations or "owner/repo" targets are queried; by default, every one the instances name.
+    repository "Administration: Read" for repository-level runners.
+
+    owners: the organisations or "owner/repo" targets to query. Set it: by default every one the
+    runner instances' ghr:Owner tags name is queried, and a job that can tag its own instance can
+    then point the App at another organisation it is installed on.
+
+    A customer-managed key on an existing secret goes in secrets_kms_key_arns.
   EOT
   type = object({
     source                  = optional(string, "create_secret")
     secret_arn              = optional(string)
-    kms_key_arn             = optional(string)
     recovery_window_in_days = optional(number, 30)
     ssm = optional(object({
       app_id_parameter_name             = string
@@ -114,6 +137,17 @@ variable "github_app" {
   validation {
     condition     = (var.github_app.source == "existing_secret") == (var.github_app.secret_arn != null)
     error_message = "github_app.secret_arn is required for, and only for, source = \"existing_secret\"."
+  }
+
+  validation {
+    # It goes into the role's policy: a wildcard would grant every secret it matches.
+    condition     = var.github_app.secret_arn == null || can(regex("^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$", var.github_app.secret_arn))
+    error_message = "github_app.secret_arn must be one secret's full ARN, without wildcards."
+  }
+
+  validation {
+    condition     = alltrue([for o in var.github_app.owners : can(regex("^[A-Za-z0-9][A-Za-z0-9-]{0,38}(/[A-Za-z0-9._-]{1,100})?$", o))])
+    error_message = "github_app.owners entries must be an organisation or \"owner/repo\"."
   }
 
   validation {
@@ -172,8 +206,22 @@ variable "remote_write" {
   })
 
   validation {
-    condition     = can(regex("^https?://[^\\s/]+", var.remote_write.url))
-    error_message = "remote_write.url must be an http(s) URL; use https except for a local receiver."
+    # Credentials or a token in the URL would end up in the function's configuration and logs.
+    condition     = can(regex("^https?://[^\\s/@?#]+(/[^\\s?#]*)?$", var.remote_write.url))
+    error_message = "remote_write.url must be an http(s) URL without credentials, a query string or a fragment."
+  }
+
+  validation {
+    condition     = startswith(var.remote_write.url, "https://") || alltrue([for a in [var.remote_write.auth.sigv4, var.remote_write.auth.basic, var.remote_write.auth.bearer] : a == null])
+    error_message = "remote_write.url must use https when remote_write.auth is set: plain http would send the credentials in the clear."
+  }
+
+  validation {
+    condition = alltrue([
+      for arn in [try(var.remote_write.auth.basic.secret_arn, null), try(var.remote_write.auth.bearer.secret_arn, null)] :
+      arn == null || can(regex("^arn:aws[a-z-]*:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+$", arn))
+    ])
+    error_message = "remote_write.auth basic/bearer secret_arn must be one secret's full ARN, without wildcards."
   }
 
   validation {
@@ -306,9 +354,9 @@ variable "lambda_memory_size" {
 }
 
 variable "lambda_timeout" {
-  description = "Seconds. Keep it under the schedule interval so samples never overlap."
+  description = "Seconds. Keep it under the schedule interval so samples never overlap, and long enough for a slow sample: 2 x source_timeout_seconds + remote_write.timeout_seconds + 5 (checks.tf)."
   type        = number
-  default     = 30
+  default     = 45
 
   validation {
     condition     = var.lambda_timeout >= 10 && var.lambda_timeout <= 59
@@ -331,12 +379,22 @@ variable "source_timeout_seconds" {
   description = "Budget for each source (SQS, CloudWatch, EC2, GitHub) in each sample."
   type        = number
   default     = 10
+
+  validation {
+    condition     = var.source_timeout_seconds >= 1 && var.source_timeout_seconds <= 60
+    error_message = "source_timeout_seconds must be from 1 to 60."
+  }
 }
 
 variable "boot_grace_seconds" {
   description = "Instances younger than this are not counted as booting: they are always unregistered."
   type        = number
   default     = 30
+
+  validation {
+    condition     = var.boot_grace_seconds >= 0 && var.boot_grace_seconds <= 3600
+    error_message = "boot_grace_seconds must be from 0 to 3600."
+  }
 }
 
 variable "log_retention_in_days" {

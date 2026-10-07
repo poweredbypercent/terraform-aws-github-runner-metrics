@@ -1,3 +1,5 @@
+import { varint } from './varint.ts'
+
 /**
  * Snappy block format with every byte emitted as a literal: a valid block that any decoder reads
  * back unchanged. Remote write requires snappy framing of the body, not compression ratio; a
@@ -7,14 +9,7 @@
  * with tag byte 61<<2 (literal, length-1 in the next two bytes, little-endian).
  */
 export function snappyLiterals(data: Uint8Array): Uint8Array {
-  const preamble: number[] = []
-  let length = data.length
-  while (length >= 0x80) {
-    preamble.push((length & 0x7f) | 0x80)
-    length >>>= 7
-  }
-  preamble.push(length)
-  const parts: Uint8Array[] = [Uint8Array.from(preamble)]
+  const parts: Uint8Array[] = [varint(data.length)]
   for (let offset = 0; offset < data.length; offset += 65536) {
     const chunk = data.subarray(offset, offset + 65536)
     const header = Buffer.alloc(3)

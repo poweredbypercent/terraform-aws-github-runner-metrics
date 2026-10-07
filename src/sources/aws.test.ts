@@ -1,30 +1,24 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import type { Instance } from '@aws-sdk/client-ec2'
-import { parseConfig } from '../config/parse.ts'
+import { queueArn as ARN, signal, testConfig } from '../test/fixtures.ts'
 import { readInstances, readQueueAges, readQueueDepths } from './aws.ts'
 
-const ARN = (name: string) => `arn:aws:sqs:eu-west-1:123456789012:${name}`
-const { runnerConfigs } = parseConfig(
-  JSON.stringify({
-    version: 1,
-    runner_configs: [
-      {
-        name: 'linux',
-        environment: 'ci-linux',
-        queue_arns: [ARN('ci-linux-queued-builds'), ARN('ci-linux-queued-builds_dead_letter')],
-      },
-      {
-        name: 'ghes',
-        environment: 'ci-ghes',
-        github_api_url: 'https://ghes.example/api/v3',
-        queue_arns: [ARN('ci-ghes-queued-builds')],
-      },
-    ],
-    remote_write: { url: 'http://localhost:9090/api/v1/write' },
-  }),
-)
-const signal = new AbortController().signal
+const { runnerConfigs } = testConfig({
+  runner_configs: [
+    {
+      name: 'linux',
+      environment: 'ci-linux',
+      queue_arns: [ARN('ci-linux-queued-builds'), ARN('ci-linux-queued-builds_dead_letter')],
+    },
+    {
+      name: 'ghes',
+      environment: 'ci-ghes',
+      github_api_url: 'https://ghes.example/api/v3',
+      queue_arns: [ARN('ci-ghes-queued-builds')],
+    },
+  ],
+})
 
 describe('readQueueDepths', () => {
   it('reads every queue, and lets a queue that fails fail alone', async () => {
@@ -74,7 +68,7 @@ describe('readQueueDepths', () => {
         runnerConfigs,
         signal,
       ),
-      /no queue could be read/,
+      /none of 3 could be read/,
     )
   })
 })

@@ -5,9 +5,10 @@ data "aws_caller_identity" "current" {}
 locals {
   # The region's id is its name on aws 5.x and 6.x alike. 6.x deprecates it (and `name`) in favour
   # of `region`, which 5.x does not have; switch to `region` once 5.x support is dropped.
-  region    = data.aws_region.current.id
-  account   = data.aws_caller_identity.current.account_id
-  partition = data.aws_partition.current.partition
+  region     = data.aws_region.current.id
+  account    = data.aws_caller_identity.current.account_id
+  partition  = data.aws_partition.current.partition
+  dns_suffix = data.aws_partition.current.dns_suffix
 
   sqs_arn_prefix = "arn:${local.partition}:sqs:${local.region}:${local.account}"
 
@@ -18,7 +19,7 @@ locals {
   # Every runner config's scale-up Lambda carries its settings as environment variables
   # (ENVIRONMENT, RUNNERS_MAXIMUM_COUNT, RUNNER_NAME_PREFIX, GHES_URL, the App's SSM parameter
   # names), in both module variants: the one place to read them without copying anything.
-  stack_runner_configs = merge(concat([{}], [
+  stack_variables = merge(concat([{}], [
     for index, stack in var.runner_stacks : (
       stack.multi_runner != null
       ? {
@@ -41,73 +42,78 @@ locals {
     )
   ])...)
 
-  # GitHub Enterprise Server serves its API under /api/v3; GHE.com data residency on an api.
-  # subdomain. github.com when neither is set.
-  ghes_api_url = {
-    for name, c in local.stack_runner_configs : name => (
-      var.github_enterprise_server_url != null ? var.github_enterprise_server_url : try(c.variables.GHES_URL, "")
-    )
-  }
-
+  # Both sources of runner configs in one shape; everything after this is shared, so the two
+  # cannot drift apart. A null github_api_url or queue_arns is filled in below.
   derived_runner_configs = {
-    for name, c in local.stack_runner_configs : name => {
+    for name, c in local.stack_variables : name => {
       environment        = try(c.variables.ENVIRONMENT, null)
       max_runners        = try(tonumber(c.variables.RUNNERS_MAXIMUM_COUNT), -1)
       runner_name_prefix = try(c.variables.RUNNER_NAME_PREFIX, "")
-      github_api_url = (
-        local.ghes_api_url[name] == "" ? "https://api.github.com" :
-        can(regex("^https://[^/]+\\.ghe\\.com/?$", local.ghes_api_url[name]))
-        ? replace(trimsuffix(local.ghes_api_url[name], "/"), "https://", "https://api.")
-        : "${trimsuffix(local.ghes_api_url[name], "/")}/api/v3"
-      )
-      # The runner module names a config's queues "<environment>-queued-builds" and, with
-      # redrive_build_queue, "<environment>-queued-builds_dead_letter". The dead-letter queue is
-      # always listed: the Lambda treats one that does not exist as absent, not as a failure.
-      queue_arns = c.queue_arns != null ? c.queue_arns : [
-        "${local.sqs_arn_prefix}:${try(c.variables.ENVIRONMENT, "")}-queued-builds",
-        "${local.sqs_arn_prefix}:${try(c.variables.ENVIRONMENT, "")}-queued-builds_dead_letter",
-      ]
-      labels = c.labels
+      github_url         = coalesce(var.github_enterprise_server_url, try(c.variables.GHES_URL, ""), "https://github.com")
+      github_api_url     = null
+      queue_arns         = c.queue_arns
+      labels             = c.labels
     }
   }
-
   explicit_runner_configs = {
     for name, c in var.runner_configs : name => {
       environment        = c.environment
       max_runners        = c.max_runners
       runner_name_prefix = c.runner_name_prefix
-      github_api_url = coalesce(
-        c.github_api_url,
-        var.github_enterprise_server_url == null ? null : "${trimsuffix(var.github_enterprise_server_url, "/")}/api/v3",
-        "https://api.github.com",
+      github_url         = coalesce(var.github_enterprise_server_url, "https://github.com")
+      github_api_url     = c.github_api_url
+      queue_arns         = c.queue_arns
+      labels             = c.labels
+    }
+  }
+
+  runner_configs = {
+    for name, c in merge(local.derived_runner_configs, local.explicit_runner_configs) : name => {
+      environment        = c.environment
+      max_runners        = c.max_runners
+      runner_name_prefix = c.runner_name_prefix
+      # github.com's API is api.github.com, GHE.com data residency's is on an api. subdomain, and
+      # GitHub Enterprise Server serves it under /api/v3.
+      github_api_url = c.github_api_url != null ? trimsuffix(c.github_api_url, "/") : (
+        trimsuffix(c.github_url, "/") == "https://github.com" ? "https://api.github.com" :
+        can(regex("^https://[^/]+\\.ghe\\.com/?$", c.github_url))
+        ? replace(trimsuffix(c.github_url, "/"), "https://", "https://api.")
+        : "${trimsuffix(c.github_url, "/")}/api/v3"
       )
+      # The runner module names a config's queues "<environment>-queued-builds" and, with
+      # redrive_build_queue, "<environment>-queued-builds_dead_letter". The dead-letter queue is
+      # always listed: the Lambda treats one that does not exist as absent, not as a failure.
       queue_arns = c.queue_arns != null ? c.queue_arns : [
-        "${local.sqs_arn_prefix}:${c.environment}-queued-builds",
-        "${local.sqs_arn_prefix}:${c.environment}-queued-builds_dead_letter",
+        "${local.sqs_arn_prefix}:${coalesce(c.environment, "unknown")}-queued-builds",
+        "${local.sqs_arn_prefix}:${coalesce(c.environment, "unknown")}-queued-builds_dead_letter",
       ]
       labels = c.labels
     }
   }
-
-  runner_configs = merge(local.derived_runner_configs, local.explicit_runner_configs)
-  queue_arns     = distinct(flatten([for c in values(local.runner_configs) : c.queue_arns]))
+  queue_arns = distinct(flatten([for c in values(local.runner_configs) : c.queue_arns]))
 
   # ---------------------------------------------------------------------------------------------
   # GitHub App credentials
   # ---------------------------------------------------------------------------------------------
 
-  first_stack_variables = try(values(local.stack_runner_configs)[0].variables, {})
+  # The runner module's App, from its SSM parameters. v7.11 can rotate across several Apps and
+  # joins their parameter names with ":"; the first App is used. Every stack is expected to use
+  # the same App (checks.tf).
+  stack_ssm_parameters = distinct([
+    for c in values(local.stack_variables) : {
+      app_id      = try(split(":", c.variables.PARAMETER_GITHUB_APP_ID_NAME)[0], null)
+      private_key = try(split(":", c.variables.PARAMETER_GITHUB_APP_KEY_BASE64_NAME)[0], null)
+    }
+  ])
   github_ssm_parameters = var.github_app.source != "runner_ssm" ? null : {
-    app_id = coalesce(
+    app_id = try(coalesce(
       try(var.github_app.ssm.app_id_parameter_name, null),
-      try(local.first_stack_variables.PARAMETER_GITHUB_APP_ID_NAME, null),
-      "unset",
-    )
-    private_key = coalesce(
+      try(local.stack_ssm_parameters[0].app_id, null),
+    ), null)
+    private_key = try(coalesce(
       try(var.github_app.ssm.private_key_base64_parameter_name, null),
-      try(local.first_stack_variables.PARAMETER_GITHUB_APP_KEY_BASE64_NAME, null),
-      "unset",
-    )
+      try(local.stack_ssm_parameters[0].private_key, null),
+    ), null)
   }
   github_secret_arn = (
     var.github_app.source == "create_secret" ? aws_secretsmanager_secret.github_app[0].arn :
@@ -134,6 +140,8 @@ locals {
       service     = local.sigv4.service
       role_arn    = local.sigv4.role_arn
       external_id = local.sigv4.external_id
+      # Names this deployment in the writer account's CloudTrail.
+      session_name = "${var.name_prefix}-${local.account}"
     } :
     var.remote_write.auth.basic != null ? { type = "basic", secret_arn = var.remote_write.auth.basic.secret_arn } :
     var.remote_write.auth.bearer != null ? { type = "bearer", secret_arn = var.remote_write.auth.bearer.secret_arn } :

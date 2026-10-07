@@ -19,6 +19,13 @@ The Lambda code, the Terraform modules, and the release pipeline that builds and
   permission it needs. Its private key lives in Secrets Manager and never enters Terraform state.
 - The function's IAM policy is generated from the features in use; read-only except for writing its
   own logs and, when configured, assuming a Prometheus writer role.
-- Logs carry error messages and HTTP statuses, never request headers, tokens or secrets.
-- Releases are built in CI from a tagged commit on `main`, are reproducible, and carry a SHA-256 and
-  a build-provenance attestation: `gh attestation verify <zip> --repo poweredbypercent/terraform-aws-github-runner-metrics`.
+- The organisations and repositories queried come from runner instance tags, which a job may be
+  able to set on its own instance: they are validated and encoded before use, and `owners` limits
+  them to an allowlist (recommended).
+- Credentials are sent over https only, and never in a URL; secret ARNs must name one secret.
+- Logs carry error messages and HTTP statuses, never request headers, tokens or secrets. A
+  remote-write response body is logged only for a 400, which explains rejected samples.
+- Releases are built in CI from a tagged commit on `main`, approved through a protected
+  environment, are reproducible, and carry a SHA-256 and a build-provenance attestation (see the
+  README for the full `gh attestation verify` command). `modules/download-lambda` requires one of
+  them as a trust anchor and verifies the zip again on every plan.

@@ -1,25 +1,16 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { parseConfig } from './config/parse.ts'
 import { scopeKey } from './domain/scope.ts'
-import type { GitHubScope, RunnerInstance } from './domain/types.ts'
+import type { RunnerInstance } from './domain/types.ts'
 import type { Logger } from './log.ts'
-import type { Sample } from './model/catalogue.ts'
+import { PREFIX, type Sample } from './model/catalogue.ts'
 import { createVanishTracker } from './model/vanish.ts'
-import { type Deps, type Sources, sampleOnce } from './run.ts'
+import type { GitHubSource, Sink, Sources } from './ports.ts'
+import { type Deps, sampleOnce } from './run.ts'
+import { NOW, ORG, queueArn, testConfig } from './test/fixtures.ts'
 
-const NOW = Date.parse('2026-10-07T12:00:00Z')
-const ARN = 'arn:aws:sqs:eu-west-1:123456789012:ci-queued-builds'
-const ORG: GitHubScope = { type: 'org', owner: 'acme', apiUrl: 'https://api.github.com' }
-const config = parseConfig(
-  JSON.stringify({
-    version: 1,
-    runner_configs: [{ name: 'ci', environment: 'ci', max_runners: 10, queue_arns: [ARN] }],
-    remote_write: { url: 'http://localhost:9090/api/v1/write' },
-    labels: { stack: 'ci' },
-    source_timeout_seconds: 1,
-  }),
-)
+const ARN = queueArn('ci-queued-builds')
+const config = testConfig({ labels: { stack: 'ci' }, source_timeout_seconds: 1 })
 const instance: RunnerInstance = {
   id: 'i-0aaaaaaaa',
   environment: 'ci',
@@ -31,6 +22,20 @@ const instance: RunnerInstance = {
   scope: ORG,
 }
 
+const github = (overrides: Partial<GitHubSource> = {}): GitHubSource => ({
+  isConfigured: async () => true,
+  registeredRunners: async scopes => ({
+    values: new Map(
+      scopes.map(s => [
+        scopeKey(s),
+        [{ name: `ci-${instance.id}`, status: 'online' as const, busy: true, scope: s }],
+      ]),
+    ),
+    failed: [],
+  }),
+  ...overrides,
+})
+
 const healthy = (): Sources => ({
   queueDepths: async () => ({
     values: new Map([[ARN, { visible: 2, inFlight: 0, delayed: 0 }]]),
@@ -38,11 +43,12 @@ const healthy = (): Sources => ({
   }),
   queueAges: async () => new Map([[ARN, 30]]),
   instances: async () => [instance],
-  registeredRunners: async scopes => ({
-    values: new Map(scopes.map(s => [scopeKey(s), []])),
-    failed: [],
-  }),
+  github: github(),
 })
+
+const failing = async (): Promise<never> => {
+  throw new Error('UnauthorizedOperation')
+}
 
 function harness(sources: Sources) {
   const pushed: Sample[][] = []
@@ -59,7 +65,7 @@ function harness(sources: Sources) {
 }
 
 const named = (samples: readonly Sample[] | undefined, suffix: string) =>
-  (samples ?? []).filter(s => s.name === `github_aws_runners_${suffix}`)
+  (samples ?? []).filter(s => s.name === `${PREFIX}${suffix}`)
 
 describe('sampleOnce', () => {
   it('pushes every family, the sampler series, and the global labels on all of them', async () => {
@@ -67,7 +73,8 @@ describe('sampleOnce', () => {
     const outcome = await sampleOnce(deps)
     assert.deepEqual(outcome.up, { sqs: true, cloudwatch: true, ec2: true, github: true })
     const [batch] = pushed
-    assert.equal(named(batch, 'booting_runners')[0]?.value, 1)
+    assert.equal(named(batch, 'busy_runners')[0]?.value, 1)
+    assert.equal(named(batch, 'booting_runners')[0]?.value, 0)
     assert.deepEqual(
       named(batch, 'source_up').map(s => [s.labels.source, s.value]),
       [
@@ -82,32 +89,61 @@ describe('sampleOnce', () => {
   })
 
   it('pushes what it has when a source fails, and says which failed', async () => {
-    const { deps, pushed, logs } = harness({
-      ...healthy(),
-      instances: async () => {
-        throw new Error('UnauthorizedOperation')
-      },
-    })
+    const { deps, pushed, logs } = harness({ ...healthy(), queueAges: failing })
     const outcome = await sampleOnce(deps)
-    assert.equal(outcome.up.ec2, false)
+    assert.equal(outcome.up.cloudwatch, false)
     const [batch] = pushed
-    assert.equal(named(batch, 'instances').length, 0)
-    assert.equal(named(batch, 'booting_runners').length, 0)
+    assert.equal(named(batch, 'scale_up_queue_oldest_message_age_seconds').length, 0)
     assert.equal(named(batch, 'scale_up_queue_messages').length, 3)
     assert.ok(
       logs.some(
         ([level, message, fields]) =>
-          level === 'warn' && message === 'source failed' && fields?.source === 'ec2',
+          level === 'warn' && message === 'source failed' && fields?.source === 'cloudwatch',
       ),
     )
   })
 
-  it('does not attempt or report GitHub when it is not configured', async () => {
-    const notConfigured = harness({ ...healthy(), registeredRunners: undefined })
-    assert.equal((await sampleOnce(notConfigured.deps)).up.github, undefined)
-    const noCredentials = harness({ ...healthy(), registeredRunners: async () => undefined })
-    assert.equal((await sampleOnce(noCredentials.deps)).up.github, undefined)
-    assert.equal(named(noCredentials.pushed[0], 'source_up').length, 3)
+  it('fails GitHub too when EC2 fails, so its series are not zeroed', async () => {
+    let ec2Up = true
+    const { deps, pushed } = harness({
+      ...healthy(),
+      instances: async () => (ec2Up ? [instance] : failing()),
+    })
+    await sampleOnce(deps)
+    ec2Up = false
+    const outcome = await sampleOnce(deps)
+    assert.deepEqual(outcome.up, { sqs: true, cloudwatch: true, ec2: false, github: false })
+    const batch = pushed[1]
+    assert.equal(named(batch, 'busy_runners').length, 0, 'no zeros: unknown is not none')
+    assert.equal(named(batch, 'instances').length, 0)
+    assert.equal(named(batch, 'booting_runners').length, 0)
+  })
+
+  it('does not attempt or report GitHub when it is not deployed or not filled in', async () => {
+    const notDeployed = harness({ ...healthy(), github: undefined })
+    assert.equal((await sampleOnce(notDeployed.deps)).up.github, undefined)
+    let asked = false
+    const notFilled = harness({
+      ...healthy(),
+      github: github({
+        isConfigured: async () => false,
+        registeredRunners: async () => {
+          asked = true
+          return { values: new Map(), failed: [] }
+        },
+      }),
+    })
+    assert.equal((await sampleOnce(notFilled.deps)).up.github, undefined)
+    assert.equal(asked, false)
+    assert.equal(named(notFilled.pushed[0], 'source_up').length, 3)
+    assert.ok(
+      notFilled.logs.some(([level, message]) => level === 'warn' && /filled in/.test(message)),
+    )
+  })
+
+  it('reports GitHub as failed when its credentials cannot be read', async () => {
+    const { deps } = harness({ ...healthy(), github: github({ isConfigured: failing }) })
+    assert.equal((await sampleOnce(deps)).up.github, false)
   })
 
   it('reports a source that outruns its budget as failed', async () => {
@@ -115,18 +151,23 @@ describe('sampleOnce', () => {
     assert.equal((await sampleOnce(deps)).up.cloudwatch, false)
   })
 
-  it('fails the invocation when the push fails', async () => {
-    const { deps } = harness(healthy())
-    await assert.rejects(
-      sampleOnce({
-        ...deps,
-        sink: {
-          push: async () => {
-            throw new Error('remote_write: 403')
-          },
-        },
-      }),
-      /403/,
-    )
+  it('fails the invocation when the push fails, keeping the vanish state for the retry', async () => {
+    let types = ['c7g.large', 'm7g.large']
+    const { deps } = harness({
+      ...healthy(),
+      instances: async () => types.map(instanceType => ({ ...instance, instanceType })),
+    })
+    await sampleOnce(deps)
+    types = ['c7g.large']
+    const rejecting: Sink = {
+      push: async () => {
+        throw new Error('remote_write: 503')
+      },
+    }
+    await assert.rejects(sampleOnce({ ...deps, sink: rejecting }), /503/)
+    const pushed: Sample[][] = []
+    await sampleOnce({ ...deps, sink: { push: async s => void pushed.push([...s]) } })
+    const zeroed = named(pushed[0], 'instances').find(s => s.labels.instance_type === 'm7g.large')
+    assert.equal(zeroed?.value, 0, 'the vanished type still gets its zero')
   })
 })

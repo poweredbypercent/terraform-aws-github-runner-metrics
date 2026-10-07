@@ -43,6 +43,7 @@ module "runner_metrics" {
   github_app = {
     source     = "existing_secret"
     secret_arn = var.github_app_metrics_secret_arn
+    owners     = var.github_owners
   }
 
   remote_write = {

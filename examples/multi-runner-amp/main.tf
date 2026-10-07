@@ -61,6 +61,9 @@ module "runner_metrics" {
   # Everything about the runner configs is read from the stack's own outputs.
   runner_stacks = [{ multi_runner = module.runners.runners_map }]
 
+  # A dedicated read-only App, in the secret the module creates; only these targets are queried.
+  github_app = { owners = var.github_owners }
+
   remote_write = {
     url = var.amp_remote_write_url
     auth = {

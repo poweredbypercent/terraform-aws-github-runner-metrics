@@ -2,7 +2,8 @@ import { createHash, createHmac } from 'node:crypto'
 import { HttpRequest } from '@smithy/protocol-http'
 import { SignatureV4 } from '@smithy/signature-v4'
 import type { AwsCredentialIdentity, Checksum, SourceData } from '@smithy/types'
-import type { RemoteWriteAuth } from '../config/types.ts'
+import type { Cached } from '../cache.ts'
+import type { RemoteWriteAuth, SigV4Auth } from '../config/types.ts'
 
 /**
  * How a remote-write request is authenticated. Each strategy turns the final request (body
@@ -21,9 +22,12 @@ export interface UnsignedRequest {
   readonly body: Uint8Array
 }
 
-export type Auth = (request: UnsignedRequest) => Promise<Record<string, string>>
-
-export type AwsCredentials = AwsCredentialIdentity
+export interface Auth {
+  /** The headers to send: the request's own, plus whatever authenticates it. */
+  sign(request: UnsignedRequest, signal: AbortSignal): Promise<Record<string, string>>
+  /** The receiver refused the credentials: forget cached ones so the next push reads them again. */
+  refused(): void
+}
 
 const bytes = (data: SourceData): string | Uint8Array =>
   typeof data === 'string'
@@ -49,43 +53,48 @@ class Sha256 implements Checksum {
   }
 }
 
+const nothingCached = (): void => {}
+
 /** SigV4 with the AWS SDK's own signer; credentials come from a provider that caches and refreshes. */
 export function sigv4Auth(options: {
   region: string
   service: string
-  credentials: () => Promise<AwsCredentials>
+  credentials: () => Promise<AwsCredentialIdentity>
   now?: () => Date
 }): Auth {
-  return async request => {
-    const signer = new SignatureV4({
-      region: options.region,
-      service: options.service,
-      credentials: options.credentials,
-      sha256: Sha256,
-    })
-    const url = new URL(request.url)
-    const signed = await signer.sign(
-      new HttpRequest({
-        method: 'POST',
-        protocol: url.protocol,
-        hostname: url.hostname,
-        ...(url.port ? { port: Number(url.port) } : {}),
-        path: url.pathname,
-        headers: { ...request.headers, host: url.host },
-        body: request.body,
-      }),
-      options.now ? { signingDate: options.now() } : {},
-    )
-    return signed.headers
+  const signer = new SignatureV4({
+    region: options.region,
+    service: options.service,
+    credentials: options.credentials,
+    sha256: Sha256,
+  })
+  return {
+    async sign(request) {
+      const url = new URL(request.url)
+      const signed = await signer.sign(
+        new HttpRequest({
+          method: 'POST',
+          protocol: url.protocol,
+          hostname: url.hostname,
+          ...(url.port ? { port: Number(url.port) } : {}),
+          path: url.pathname,
+          headers: { ...request.headers, host: url.host },
+          body: request.body,
+        }),
+        options.now ? { signingDate: options.now() } : {},
+      )
+      return signed.headers
+    },
+    refused: nothingCached,
   }
 }
 
-/** Reads a secret holding JSON; undefined when it has not been filled in yet. */
-export type ReadSecret = (arn: string) => Promise<string | undefined>
+/** A secret's value, read when needed and cached; undefined until someone fills it in. */
+export type SecretValue = Cached<string>
 
-async function secretJson(readSecret: ReadSecret, arn: string): Promise<Record<string, unknown>> {
-  const raw = await readSecret(arn)
-  if (!raw) throw new Error(`remote-write secret ${arn} has no value`)
+async function secretJson(secret: SecretValue, signal: AbortSignal) {
+  const raw = await secret.get(signal)
+  if (!raw) throw new Error('the remote-write secret has no value yet')
   try {
     return JSON.parse(raw) as Record<string, unknown>
   } catch {
@@ -94,36 +103,48 @@ async function secretJson(readSecret: ReadSecret, arn: string): Promise<Record<s
   }
 }
 
-export function basicAuth(readSecret: ReadSecret, arn: string): Auth {
-  return async request => {
-    const { username, password } = await secretJson(readSecret, arn)
-    if (typeof username !== 'string' || typeof password !== 'string') {
-      throw new Error('basic auth secret needs {"username": "...", "password": "..."}')
-    }
-    const token = Buffer.from(`${username}:${password}`).toString('base64')
-    return { ...request.headers, authorization: `Basic ${token}` }
+const withAuthorization = (request: UnsignedRequest, authorization: string) => ({
+  ...request.headers,
+  authorization,
+})
+
+export function basicAuth(secret: SecretValue): Auth {
+  return {
+    async sign(request, signal) {
+      const { username, password } = await secretJson(secret, signal)
+      if (typeof username !== 'string' || typeof password !== 'string') {
+        throw new Error('basic auth secret needs {"username": "...", "password": "..."}')
+      }
+      const token = Buffer.from(`${username}:${password}`).toString('base64')
+      return withAuthorization(request, `Basic ${token}`)
+    },
+    refused: () => secret.invalidate(),
   }
 }
 
-export function bearerAuth(readSecret: ReadSecret, arn: string): Auth {
-  return async request => {
-    const { token } = await secretJson(readSecret, arn)
-    if (typeof token !== 'string' || token === '') {
-      throw new Error('bearer auth secret needs {"token": "..."} or the bare token')
-    }
-    return { ...request.headers, authorization: `Bearer ${token}` }
+export function bearerAuth(secret: SecretValue): Auth {
+  return {
+    async sign(request, signal) {
+      const { token } = await secretJson(secret, signal)
+      if (typeof token !== 'string' || token === '') {
+        throw new Error('bearer auth secret needs {"token": "..."} or the bare token')
+      }
+      return withAuthorization(request, `Bearer ${token}`)
+    },
+    refused: () => secret.invalidate(),
   }
 }
 
-export const noAuth: Auth = async request => ({ ...request.headers })
+export const noAuth: Auth = {
+  sign: async request => ({ ...request.headers }),
+  refused: nothingCached,
+}
 
 export function authFromConfig(
   auth: RemoteWriteAuth,
   deps: {
-    readSecret: ReadSecret
-    credentialsFor: (
-      auth: Extract<RemoteWriteAuth, { type: 'sigv4' }>,
-    ) => () => Promise<AwsCredentials>
+    secret: (arn: string) => SecretValue
+    credentialsFor: (auth: SigV4Auth) => () => Promise<AwsCredentialIdentity>
   },
 ): Auth {
   switch (auth.type) {
@@ -136,8 +157,8 @@ export function authFromConfig(
         credentials: deps.credentialsFor(auth),
       })
     case 'basic':
-      return basicAuth(deps.readSecret, auth.secretArn)
+      return basicAuth(deps.secret(auth.secretArn))
     case 'bearer':
-      return bearerAuth(deps.readSecret, auth.secretArn)
+      return bearerAuth(deps.secret(auth.secretArn))
   }
 }

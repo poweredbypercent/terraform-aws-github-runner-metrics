@@ -1,5 +1,5 @@
 # terraform test, against a mock AWS provider: how the module reads runner stacks, what it hands
-# the Lambda, and which permissions it grants. Needs Terraform >= 1.7 (mock providers).
+# the Lambda, and which permissions it grants. Needs Terraform >= 1.11 (override_during).
 
 mock_provider "aws" {
   override_data {
@@ -12,7 +12,7 @@ mock_provider "aws" {
   }
   override_data {
     target = data.aws_partition.current
-    values = { partition = "aws" }
+    values = { partition = "aws", dns_suffix = "amazonaws.com" }
   }
   # Policy documents are rendered by the provider; IAM resources only need valid JSON here, and
   # the tests assert on the statements as configured.
@@ -122,13 +122,14 @@ run "hands_the_lambda_its_configuration" {
   }
   assert {
     condition = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG).remote_write.auth == {
-      type        = "sigv4"
-      region      = "eu-west-1"
-      service     = "aps"
-      role_arn    = "arn:aws:iam::210987654321:role/prometheus-writer"
-      external_id = null
+      type         = "sigv4"
+      region       = "eu-west-1"
+      service      = "aps"
+      role_arn     = "arn:aws:iam::210987654321:role/prometheus-writer"
+      external_id  = null
+      session_name = "github-runner-metrics-123456789012"
     }
-    error_message = "SigV4 takes its region from the AMP URL"
+    error_message = "SigV4 takes its region from the AMP URL, and names the deployment in its session"
   }
   assert {
     condition     = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG).github.credentials == { type = "none" }
@@ -226,4 +227,159 @@ run "rejects_a_zip_given_both_ways" {
     lambda_zip     = { path = "lambda.zip", s3 = { bucket = "b", key = "k" } }
   }
   expect_failures = [var.lambda_zip]
+}
+
+run "explicit_runner_configs_find_the_github_api_the_same_way" {
+  command = plan
+
+  variables {
+    github_enterprise_server_url = "https://acme.ghe.com"
+    runner_configs = {
+      data_residency = { environment = "ci" }
+      own_api        = { environment = "ci-own", github_api_url = "https://ghes.example/api/v3/" }
+    }
+  }
+
+  assert {
+    condition     = output.runner_configs.data_residency.github_api_url == "https://api.acme.ghe.com"
+    error_message = "GHE.com is an api. subdomain whichever way the runner config was given"
+  }
+  assert {
+    condition     = output.runner_configs.own_api.github_api_url == "https://ghes.example/api/v3"
+    error_message = "an explicit API URL is used as given, without its trailing slash"
+  }
+}
+
+run "reads_the_runner_module_app_from_ssm" {
+  command = plan
+
+  variables {
+    github_app = { source = "runner_ssm" }
+    runner_stacks = [{
+      multi_runner = {
+        linux = { lambda_up = { environment = [{ variables = {
+          ENVIRONMENT = "ci-linux"
+          # v7.11 joins the parameters of several Apps with ":".
+          PARAMETER_GITHUB_APP_ID_NAME         = "/gh/app-id:/gh/second-app-id"
+          PARAMETER_GITHUB_APP_KEY_BASE64_NAME = "/gh/app-key:/gh/second-app-key"
+        } }] } }
+      }
+    }]
+  }
+
+  assert {
+    condition = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG).github.credentials == {
+      type                  = "ssm"
+      app_id_parameter      = "/gh/app-id"
+      private_key_parameter = "/gh/app-key"
+    }
+    error_message = "the first App's parameters are read"
+  }
+  assert {
+    condition = contains(
+      flatten([for s in data.aws_iam_policy_document.lambda.statement : s.resources if contains(s.actions, "ssm:GetParameter")]),
+      "arn:aws:ssm:eu-west-1:123456789012:parameter/gh/app-key",
+    )
+    error_message = "the role can read exactly those parameters"
+  }
+}
+
+run "warns_when_the_runner_module_app_cannot_be_found" {
+  command = plan
+  variables {
+    github_app     = { source = "runner_ssm" }
+    runner_configs = { ci = { environment = "ci" } }
+  }
+  expect_failures = [check.github_app]
+}
+
+run "reads_an_existing_secret_through_its_key_only" {
+  command = plan
+
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    github_app = {
+      source     = "existing_secret"
+      secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-app-AbCdEf"
+    }
+    secrets_kms_key_arns = ["arn:aws:kms:eu-west-1:123456789012:key/1111-2222"]
+  }
+
+  assert {
+    condition = contains(
+      flatten([for s in data.aws_iam_policy_document.lambda.statement : s.resources if contains(s.actions, "secretsmanager:GetSecretValue")]),
+      "arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-app-AbCdEf",
+    )
+    error_message = "the existing secret can be read"
+  }
+  assert {
+    condition = jsonencode(flatten([
+      for s in data.aws_iam_policy_document.lambda.statement : [for c in s.condition : c.values if c.variable == "kms:ViaService"]
+      if contains(s.actions, "kms:Decrypt")
+    ])) == jsonencode(["secretsmanager.eu-west-1.amazonaws.com", "ssm.eu-west-1.amazonaws.com"])
+    error_message = "the key decrypts only through Secrets Manager and SSM"
+  }
+}
+
+run "takes_a_hash_without_reading_the_zip" {
+  command = plan
+
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    lambda_zip     = { path = "built-later.zip", source_code_hash = "c29tZS1oYXNo" }
+  }
+
+  assert {
+    condition     = aws_lambda_function.this.source_code_hash == "c29tZS1oYXNo"
+    error_message = "a given hash is used, and the zip need not exist yet"
+  }
+}
+
+run "warns_about_a_queue_in_another_region" {
+  command = plan
+  variables {
+    runner_configs = {
+      ci = { environment = "ci", queue_arns = ["arn:aws:sqs:us-east-1:123456789012:ci-queued-builds"] }
+    }
+  }
+  expect_failures = [check.runner_configs]
+}
+
+run "warns_when_the_timeout_cannot_fit_a_slow_sample" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    lambda_timeout = 20
+  }
+  expect_failures = [check.timeout_budget]
+}
+
+run "rejects_a_wildcard_secret_arn" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    github_app     = { source = "existing_secret", secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:*" }
+  }
+  expect_failures = [var.github_app]
+}
+
+run "rejects_credentials_over_plain_http" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write = {
+      url  = "http://prometheus.example/api/v1/write"
+      auth = { bearer = { secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:token-AbCdEf" } }
+    }
+  }
+  expect_failures = [var.remote_write]
+}
+
+run "rejects_credentials_in_the_url" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write   = { url = "https://user:pass@prometheus.example/api/v1/write" }
+  }
+  expect_failures = [var.remote_write]
 }

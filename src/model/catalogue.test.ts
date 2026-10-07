@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { describe, it } from 'node:test'
+import { BUILT_IN_LABELS } from '../domain/labels.ts'
 import { ALL_METRICS, PREFIX, renderMetricDocs, seriesKey } from './catalogue.ts'
 
 describe('catalogue', () => {
@@ -19,6 +20,15 @@ describe('catalogue', () => {
       seriesKey({ name: 'm', labels: { b: '2', a: '1' } }),
       seriesKey({ name: 'm', labels: { a: '1', b: '2' } }),
     )
+  })
+
+  it('reserves exactly the labels the metrics set, here and in the Terraform validation', () => {
+    const used = [...new Set(ALL_METRICS.flatMap(m => m.labels))].sort()
+    assert.deepEqual([...BUILT_IN_LABELS].sort(), used)
+    const variables = readFileSync(new URL('../../variables.tf', import.meta.url), 'utf8')
+    const reserved = variables.match(/!contains\((\[[^\]]*"runner_config"[^\]]*\]), k\)/)?.[1]
+    assert.ok(reserved, 'variables.tf: labels validation not found')
+    assert.deepEqual((JSON.parse(reserved) as string[]).sort(), used)
   })
 
   it('keeps docs/metrics.md in step with the catalogue', () => {

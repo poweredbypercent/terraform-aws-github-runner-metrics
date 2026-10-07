@@ -27,15 +27,19 @@ export interface GitHubConfig {
   readonly owners: readonly string[]
 }
 
+export interface SigV4Auth {
+  readonly type: 'sigv4'
+  readonly region: string
+  readonly service: string
+  readonly roleArn: string | undefined
+  readonly externalId: string | undefined
+  /** The assumed role's session name, so the writer account's CloudTrail can tell deployments apart. */
+  readonly sessionName: string
+}
+
 export type RemoteWriteAuth =
   | { readonly type: 'none' }
-  | {
-      readonly type: 'sigv4'
-      readonly region: string
-      readonly service: string
-      readonly roleArn: string | undefined
-      readonly externalId: string | undefined
-    }
+  | SigV4Auth
   | { readonly type: 'basic'; readonly secretArn: string }
   | { readonly type: 'bearer'; readonly secretArn: string }
 

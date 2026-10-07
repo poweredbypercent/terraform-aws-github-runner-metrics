@@ -96,6 +96,7 @@ describe('parseConfig', () => {
       service: 'aps',
       roleArn: 'arn:aws:iam::210987654321:role/writer',
       externalId: undefined,
+      sessionName: 'github-runner-metrics',
     })
     assert.deepEqual(config.remoteWrite.headers, { 'X-Scope-OrgID': 'ci' })
   })
@@ -132,6 +133,47 @@ describe('parseConfig', () => {
     }
   })
 
+  it('keeps credentials off plain http and out of URLs', () => {
+    const secretArn = 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:remote-write-AbCdEf'
+    const problems = problemsOf({
+      ...minimal,
+      runner_configs: [
+        { ...minimal.runner_configs[0], github_api_url: 'http://ghe.example/api/v3' },
+      ],
+      remote_write: {
+        url: 'http://u:p@prom.example/write?x=1',
+        auth: { type: 'bearer', secret_arn: secretArn },
+      },
+    })
+    for (const expected of [
+      /github_api_url must use https/,
+      /remote_write\.url must use https/,
+      /remote_write\.url must not contain credentials/,
+      /remote_write\.url must not contain a query string/,
+    ]) {
+      assert.ok(
+        problems.some(p => expected.test(p)),
+        `${expected}:\n${problems.join('\n')}`,
+      )
+    }
+  })
+
+  it('refuses a wildcard secret ARN', () => {
+    const problems = problemsOf({
+      ...minimal,
+      github: {
+        credentials: {
+          type: 'secret',
+          secret_arn: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:*',
+        },
+      },
+    })
+    assert.ok(
+      problems.some(p => /github\.credentials\.secret_arn/.test(p)),
+      problems.join('\n'),
+    )
+  })
+
   it('rejects a missing or unparseable CONFIG', () => {
     assert.throws(() => parseConfig(undefined), /CONFIG must be set/)
     assert.throws(() => parseConfig('{'), /CONFIG must be set/)
@@ -141,14 +183,16 @@ describe('parseConfig', () => {
 describe('queueFromArn', () => {
   it('derives the queue URL for other partitions', () => {
     const queue = queueFromArn('arn:aws-cn:sqs:cn-north-1:123456789012:ci-queued-builds')
-    assert.ok(typeof queue !== 'string')
-    assert.equal(queue.url, 'https://sqs.cn-north-1.amazonaws.com.cn/123456789012/ci-queued-builds')
+    assert.ok(queue.ok)
+    assert.equal(
+      queue.value.url,
+      'https://sqs.cn-north-1.amazonaws.com.cn/123456789012/ci-queued-builds',
+    )
   })
 
   it('refuses partitions it has no endpoint for', () => {
-    assert.match(
-      String(queueFromArn('arn:aws-iso:sqs:us-iso-east-1:123456789012:q')),
-      /partition aws-iso/,
-    )
+    const queue = queueFromArn('arn:aws-iso:sqs:us-iso-east-1:123456789012:q')
+    assert.ok(!queue.ok)
+    assert.match(queue.error, /partition aws-iso/)
   })
 })
