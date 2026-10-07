@@ -35,7 +35,8 @@ check "runner_configs" {
 
 check "github_app" {
   assert {
-    condition     = local.github_ssm_parameters == null || length(compact(values(local.github_ssm_parameters))) == 2
+    # A conditional, not ||: Terraform before 1.12 evaluates both sides of ||, and values(null) fails.
+    condition     = local.github_ssm_parameters == null ? true : length(compact(values(local.github_ssm_parameters))) == 2
     error_message = "github_app.source = \"runner_ssm\" but the runner module's GitHub App parameter names were not found; set github_app.ssm."
   }
 

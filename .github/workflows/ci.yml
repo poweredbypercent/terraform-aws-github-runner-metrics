@@ -68,7 +68,7 @@ jobs:
       - run: bash scripts/e2e.sh
 
   terraform-validate:
-    name: Terraform ${{ matrix.terraform }}, AWS provider ${{ matrix.aws }}.x - validate
+    name: Terraform ${{ matrix.terraform }}, AWS provider ${{ matrix.aws }} - validate
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -99,7 +99,7 @@ jobs:
       - run: terraform -chdir=modules/download-lambda init -backend=false -input=false && terraform -chdir=modules/download-lambda validate
 
   terraform-test:
-    name: Terraform ${{ matrix.terraform }}, AWS provider ${{ matrix.aws }}.x - test
+    name: Terraform ${{ matrix.terraform }}, AWS provider ${{ matrix.aws }} - test
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
