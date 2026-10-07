@@ -12,8 +12,8 @@ variable "runner_stacks" {
 
     Each runner config's environment, runner cap, runner name prefix, queues and GitHub Enterprise
     Server URL are read from its scale-up Lambda's configuration. `name` is the runner_config label
-    for a root-module stack (multi-runner stacks use their map keys); `labels` are added to that
-    stack's series.
+    of a root-module stack, and required for one (multi-runner stacks use their map keys); `labels`
+    are added to that stack's series.
   EOT
   type = list(object({
     name         = optional(string)
@@ -22,7 +22,8 @@ variable "runner_stacks" {
     queues       = optional(any)
     labels       = optional(map(string), {})
   }))
-  default = []
+  default  = []
+  nullable = false
 
   validation {
     condition     = alltrue([for s in var.runner_stacks : (s.multi_runner == null) != (s.runners == null)])
@@ -35,6 +36,12 @@ variable "runner_stacks" {
   }
 
   validation {
+    # A position-derived name would change, and rename every series, when the list is reordered.
+    condition     = alltrue([for s in var.runner_stacks : s.runners == null || s.name != null])
+    error_message = "runner_stacks[].name is required for a root-module stack (runners): it is the runner_config label of its series."
+  }
+
+  validation {
     condition     = alltrue([for s in var.runner_stacks : s.name == null || can(regex("^[A-Za-z0-9_.-]+$", s.name))])
     error_message = "runner_stacks[].name may contain only letters, digits, '.', '-' and '_'."
   }
@@ -44,18 +51,25 @@ variable "runner_configs" {
   description = <<-EOT
     Runner configs given explicitly, for stacks whose outputs are not to hand (another state, another
     tool). The key is the runner_config label. `environment` is the stack's ghr:environment tag
-    value; the queues default to "<environment>-queued-builds" and its "_dead_letter" queue in this
-    account and region.
+    value. `queues` defaults to "<environment>-queued-builds" and its "_dead_letter" queue in this
+    account and region; give them for queues named otherwise, as
+    { main = "<ARN>", dead_letter = "<ARN>" } with dead_letter optional. `max_runners` -1 is
+    unlimited. `labels` are added to this runner config's series (Prometheus label names, not a
+    built-in label, non-empty values).
   EOT
   type = map(object({
     environment        = string
     max_runners        = optional(number, -1)
     runner_name_prefix = optional(string, "")
     github_api_url     = optional(string)
-    queue_arns         = optional(list(string))
-    labels             = optional(map(string), {})
+    queues = optional(object({
+      main        = string
+      dead_letter = optional(string)
+    }))
+    labels = optional(map(string), {})
   }))
-  default = {}
+  default  = {}
+  nullable = false
 
   validation {
     condition     = alltrue([for name in keys(var.runner_configs) : can(regex("^[A-Za-z0-9_.-]+$", name))])
@@ -65,6 +79,22 @@ variable "runner_configs" {
   validation {
     condition     = alltrue([for c in values(var.runner_configs) : can(regex("^[A-Za-z0-9_-]+$", c.environment))])
     error_message = "runner_configs[].environment may contain only letters, digits, '-' and '_' (it names the queues)."
+  }
+
+  validation {
+    condition     = alltrue([for c in values(var.runner_configs) : c.max_runners == -1 || (c.max_runners >= 0 && c.max_runners <= 100000)])
+    error_message = "runner_configs[].max_runners must be -1 (unlimited) or from 0 to 100000."
+  }
+
+  validation {
+    # They go into the role's policy: a wildcard would grant every queue it matches.
+    condition = alltrue(flatten([
+      for c in values(var.runner_configs) : [
+        for arn in compact([try(c.queues.main, null), try(c.queues.dead_letter, null)]) :
+        can(regex("^arn:aws[a-z-]*:sqs:[a-z0-9-]+:[0-9]{12}:([A-Za-z0-9_-]{1,80}|[A-Za-z0-9_-]{1,75}\\.fifo)$", arn))
+      ]
+    ]))
+    error_message = "runner_configs[].queues must be SQS queue ARNs, without wildcards."
   }
 
   validation {
@@ -78,18 +108,10 @@ variable "runner_configs" {
 }
 
 variable "labels" {
-  description = "Constant labels added to every series, for example { cluster = \"ci\" }."
+  description = "Constant labels added to every series, for example { cluster = \"ci\" }: Prometheus label names, not a built-in label, non-empty values."
   type        = map(string)
   default     = {}
-
-  validation {
-    condition = alltrue([
-      for k in keys(var.labels) :
-      can(regex("^[a-zA-Z_][a-zA-Z0-9_]*$", k)) && !startswith(k, "__") &&
-      !contains(["environment", "runner_config", "queue", "visibility", "instance_type", "lifecycle", "state", "runner_type", "organization", "repository", "source"], k)
-    ])
-    error_message = "labels keys must be Prometheus label names, not start with \"__\", and not reuse a built-in label."
-  }
+  nullable    = false
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -116,6 +138,13 @@ variable "github_app" {
     job that can tag its own instance could otherwise point the App at another organisation it is
     installed on.
 
+    ssm (runner_ssm only): the runner module's parameter names, { app_id_parameter_name,
+    private_key_base64_parameter_name }, when they cannot be read from the runner stacks.
+
+    recovery_window_in_days (create_secret only): how long a destroyed secret can be restored, 0 or
+    7-30. While it lasts, its name cannot be used again, so a destroy and re-apply of the same
+    name_prefix fails; set 0 where that matters.
+
     A customer-managed key on an existing secret goes in secrets_kms_key_arns.
   EOT
   type = object({
@@ -128,7 +157,8 @@ variable "github_app" {
     }))
     owners = optional(list(string), [])
   })
-  default = {}
+  default  = {}
+  nullable = false
 
   validation {
     condition     = contains(["create_secret", "existing_secret", "runner_ssm", "disabled"], var.github_app.source)
@@ -164,6 +194,15 @@ variable "github_app" {
   }
 
   validation {
+    # They go into the role's policy: a wildcard would grant every parameter it matches.
+    condition = var.github_app.ssm == null || alltrue([
+      for name in [try(var.github_app.ssm.app_id_parameter_name, ""), try(var.github_app.ssm.private_key_base64_parameter_name, "")] :
+      can(regex("^/?[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$", name))
+    ])
+    error_message = "github_app.ssm parameter names must be SSM parameter names, without wildcards."
+  }
+
+  validation {
     condition     = var.github_app.recovery_window_in_days == 0 || (var.github_app.recovery_window_in_days >= 7 && var.github_app.recovery_window_in_days <= 30)
     error_message = "github_app.recovery_window_in_days must be 0 or from 7 to 30."
   }
@@ -195,7 +234,11 @@ variable "remote_write" {
       bearer   a Secrets Manager secret with {"token": "..."} or the bare token.
 
     headers: plain, non-secret extras such as X-Scope-OrgID for Mimir; they are visible in the
-    function's configuration, so never put credentials there.
+    function's configuration, so a header named like a credential (key, token, secret, auth...)
+    is refused.
+
+    The URL must be the endpoint itself: a redirect is not followed. With sigv4 and no region, the
+    region is read from an AWS hostname (an AMP or VPC endpoint URL).
   EOT
   type = object({
     url = string
@@ -238,20 +281,22 @@ variable "remote_write" {
   }
 
   validation {
+    # The same pattern as local.url_region (remote_write.tf), which reads the region.
     condition = (
       var.remote_write.auth.sigv4 == null ||
       try(var.remote_write.auth.sigv4.region, null) != null ||
-      can(regex("\\.([a-z0-9-]+)\\.amazonaws\\.com", var.remote_write.url))
+      can(regex("^https://[^/]*\\.([a-z]{2}(?:-[a-z]+)+-[0-9]+)\\.(?:[a-z0-9-]+\\.)*amazonaws\\.com(?:\\.cn)?(?:[:/]|$)", var.remote_write.url))
     )
-    error_message = "remote_write.auth.sigv4.region is required unless the URL names an AWS region."
+    error_message = "remote_write.auth.sigv4.region is required unless the URL is an AWS hostname naming a region."
   }
 
   validation {
+    # It goes into the role's policy: a wildcard would let it assume every role it matches.
     condition = (
       try(var.remote_write.auth.sigv4.role_arn, null) == null ||
-      can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+", var.remote_write.auth.sigv4.role_arn))
+      can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/[A-Za-z0-9/_+=,.@-]+$", var.remote_write.auth.sigv4.role_arn))
     )
-    error_message = "remote_write.auth.sigv4.role_arn must be an IAM role ARN."
+    error_message = "remote_write.auth.sigv4.role_arn must be one IAM role's ARN, without wildcards."
   }
 
   validation {
@@ -270,6 +315,17 @@ variable "remote_write" {
   }
 
   validation {
+    # They are visible in the function's configuration: credentials belong in basic or bearer auth.
+    condition     = alltrue([for name in keys(var.remote_write.headers) : !can(regex("(?i)key|token|secret|passw|credential|auth|cookie|session", name))])
+    error_message = "remote_write.headers looks like it carries a credential: use remote_write.auth basic or bearer, which keep it in a secret."
+  }
+
+  validation {
+    condition     = alltrue([for value in values(var.remote_write.headers) : can(regex("^[ -~]+$", value))])
+    error_message = "remote_write.headers values must be non-empty, printable and on one line."
+  }
+
+  validation {
     condition     = var.remote_write.timeout_seconds >= 1 && var.remote_write.timeout_seconds <= 60
     error_message = "remote_write.timeout_seconds must be from 1 to 60."
   }
@@ -282,8 +338,9 @@ variable "remote_write" {
 variable "lambda_zip" {
   description = <<-EOT
     The function code: a release zip of this module's version. Either a local file (path; use
-    modules/download-lambda to fetch and verify one) or an object in S3. Pin the S3 object_version,
-    or a changed object is not deployed.
+    modules/download-lambda to fetch and verify one) or an object in S3, pinned by its
+    object_version: the function runs with access to the GitHub App's key, so it deploys exactly the
+    object you verified, and a new version is deployed by changing it.
   EOT
   type = object({
     path             = optional(string)
@@ -291,9 +348,10 @@ variable "lambda_zip" {
     s3 = optional(object({
       bucket         = string
       key            = string
-      object_version = optional(string)
+      object_version = string
     }))
   })
+  nullable = false
 
   validation {
     condition     = (var.lambda_zip.path == null) != (var.lambda_zip.s3 == null)
@@ -318,8 +376,9 @@ variable "schedule_expression" {
   default     = "rate(1 minute)"
 
   validation {
-    condition     = can(regex("^(rate\\([1-9][0-9]* (minute|minutes|hour|hours)\\)|cron\\(.+\\))$", var.schedule_expression))
-    error_message = "schedule_expression must be a rate(...) in minutes or hours, or a cron(...)."
+    # EventBridge wants the singular for 1 and the plural above it.
+    condition     = can(regex("^(rate\\(1 (minute|hour)\\)|rate\\(([2-9]|[1-9][0-9]+) (minutes|hours)\\)|cron\\(.+\\))$", var.schedule_expression))
+    error_message = "schedule_expression must be rate(1 minute), rate(N minutes), rate(1 hour), rate(N hours) or a cron(...)."
   }
 }
 
@@ -363,7 +422,7 @@ variable "lambda_memory_size" {
 }
 
 variable "lambda_timeout" {
-  description = "Seconds. Keep it under the schedule interval so samples never overlap, and long enough for a slow sample: 2 x source_timeout_seconds + remote_write.timeout_seconds + 5 (checks.tf)."
+  description = "Seconds. Keep it under the schedule interval so samples never overlap, and long enough for a slow sample: at least 2 x source_timeout_seconds + remote_write.timeout_seconds + 5, which the module enforces."
   type        = number
   default     = 45
 
@@ -427,6 +486,7 @@ variable "secrets_kms_key_arns" {
   description = "Other customer-managed keys that encrypt secrets or parameters this module reads (an existing GitHub App secret, a remote-write credential, the runner module's SSM parameters)."
   type        = list(string)
   default     = []
+  nullable    = false
 }
 
 variable "vpc_config" {
@@ -476,4 +536,5 @@ variable "tags" {
   description = "Tags for every resource."
   type        = map(string)
   default     = {}
+  nullable    = false
 }

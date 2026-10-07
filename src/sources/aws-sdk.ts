@@ -27,13 +27,33 @@ import type { DescribeRunnerInstances, GetQueueAgeDatapoints, GetQueueAttributes
 
 type Send<C, O> = { send(command: C, options: { abortSignal: AbortSignal }): Promise<O> }
 
+/** SQS endpoints by partition. */
+const SQS_DNS_SUFFIX: Readonly<Record<string, string>> = {
+  aws: 'amazonaws.com',
+  'aws-us-gov': 'amazonaws.com',
+  'aws-cn': 'amazonaws.com.cn',
+}
+
+/** arn:<partition>:sqs:<region>:<account>:<name> as the URL SQS addresses the queue by. */
+export function sqsQueueUrl(arn: string): string {
+  const [, partition = '', , region = '', account = '', name = ''] = arn.split(':')
+  const suffix = SQS_DNS_SUFFIX[partition]
+  if (!suffix) throw new Error(`SQS in partition ${partition} is not supported`)
+  return `https://sqs.${region}.${suffix}/${account}/${name}`
+}
+
+const isNonExistentQueue = (error: unknown): boolean =>
+  error instanceof Error &&
+  /NonExistentQueue|QueueDoesNotExist/.test(`${error.name} ${error.message}`)
+
+/** A queue's attributes, or undefined when the queue does not exist. */
 export const sqsQueueAttributes =
   (sqs: Send<GetQueueAttributesCommand, GetQueueAttributesCommandOutput>): GetQueueAttributes =>
-  async (QueueUrl, abortSignal) =>
-    (
-      await sqs.send(
+  async (queueArn, abortSignal) => {
+    try {
+      const out = await sqs.send(
         new GetQueueAttributesCommand({
-          QueueUrl,
+          QueueUrl: sqsQueueUrl(queueArn),
           AttributeNames: [
             'ApproximateNumberOfMessages',
             'ApproximateNumberOfMessagesNotVisible',
@@ -42,7 +62,12 @@ export const sqsQueueAttributes =
         }),
         { abortSignal },
       )
-    ).Attributes ?? {}
+      return out.Attributes ?? {}
+    } catch (error) {
+      if (isNonExistentQueue(error)) return undefined
+      throw error
+    }
+  }
 
 /** GetMetricData takes up to 500 queries a call. */
 const QUERIES_PER_CALL = 500

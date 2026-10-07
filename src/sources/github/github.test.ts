@@ -13,6 +13,8 @@ import {
   mintJwt,
   parseAppSecret,
 } from './credentials.ts'
+import { scopeApiPath } from './paths.ts'
+import { parseInstallationId, parseInstallationToken, parseRunnersPage } from './responses.ts'
 import { readRegisteredRunners } from './runners.ts'
 
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 })
@@ -49,6 +51,39 @@ describe('credentials', () => {
     assert.throws(() => parseAppSecret('{"app_id":"x"}'), /must be JSON/)
     assert.throws(() => parseAppSecret('not json'), /must be JSON/)
     assert.throws(() => credentialsFromRunnerModule('123', 'bm9wZQ=='), /base64 PEM key/)
+  })
+})
+
+describe('GitHub answers and paths', () => {
+  it('builds the REST path for an organisation or a repository, encoded', () => {
+    assert.equal(scopeApiPath(REPO), '/repos/acme/widgets')
+    assert.equal(scopeApiPath(ORG), '/orgs/acme')
+  })
+
+  it('reads well-formed answers', () => {
+    assert.equal(parseInstallationId({ id: 7 }), 7)
+    assert.deepEqual(parseInstallationToken({ token: 't', expires_at: '2026-10-07T13:00:00Z' }), {
+      token: 't',
+      expiresAt: Date.parse('2026-10-07T13:00:00Z'),
+    })
+    assert.deepEqual(parseRunnersPage({ runners: [{ name: 'a', status: 'online', busy: true }] }), [
+      { name: 'a', online: true, busy: true },
+    ])
+  })
+
+  it('refuses malformed answers by name, without quoting them', () => {
+    for (const body of [null, {}, { id: '7' }, { id: 0 }]) {
+      assert.throws(() => parseInstallationId(body), { name: 'GitHubResponseError' })
+    }
+    for (const body of [{ token: 'secret' }, { token: 'secret', expires_at: 'soon' }]) {
+      assert.throws(
+        () => parseInstallationToken(body),
+        (error: Error) => error.name === 'GitHubResponseError' && !error.message.includes('secret'),
+      )
+    }
+    for (const body of [{}, { runners: 'x' }, { runners: [{ status: 'online' }] }]) {
+      assert.throws(() => parseRunnersPage(body), { name: 'GitHubResponseError' })
+    }
   })
 })
 
@@ -235,7 +270,9 @@ describe('readRegisteredRunners', () => {
     )
     assert.equal(result.values.get(scopeKey(ORG))?.length, 101)
     assert.equal(result.values.get(scopeKey(ORG))?.[100]?.status, 'offline')
-    assert.deepEqual(result.failed, [scopeKey(missing)])
+    assert.deepEqual(result.failed, [
+      { key: scopeKey(missing), error: 'GitHub GET /orgs/nope/installation: 404' },
+    ])
   })
 
   it('queries only the allowed owners, whatever their case in the tags', async () => {

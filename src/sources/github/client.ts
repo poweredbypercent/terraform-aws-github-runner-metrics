@@ -1,8 +1,10 @@
 import type { Cached } from '../../cache.ts'
-import { scopeApiPath, scopeKey } from '../../domain/scope.ts'
+import { scopeKey } from '../../domain/scope.ts'
 import type { GitHubScope } from '../../domain/types.ts'
 import type { Fetch } from '../../http.ts'
 import { type AppCredentials, mintJwt } from './credentials.ts'
+import { scopeApiPath } from './paths.ts'
+import { type InstallationToken, parseInstallationId, parseInstallationToken } from './responses.ts'
 
 /**
  * GitHub REST calls as a GitHub App, with installation tokens cached across warm invocations.
@@ -49,7 +51,7 @@ export function createGitHubAppClient(options: {
 }): GitHubAppClient {
   let mintedWith: AppCredentials | undefined
   const installations = new Map<string, number>()
-  const tokens = new Map<string, { token: string; expiresAt: number }>()
+  const tokens = new Map<string, InstallationToken>()
 
   const request = async (
     method: 'GET' | 'POST',
@@ -111,25 +113,25 @@ export function createGitHubAppClient(options: {
     const key = scopeKey(scope)
     const known = installations.get(key)
     if (known !== undefined) return known
-    const { id } = (await asApp(
-      'GET',
-      `${scope.apiUrl}${scopeApiPath(scope)}/installation`,
-      signal,
-    )) as { id: number }
+    const id = parseInstallationId(
+      await asApp('GET', `${scope.apiUrl}${scopeApiPath(scope)}/installation`, signal),
+    )
     installations.set(key, id)
     return id
   }
 
-  const mint = async (scope: GitHubScope, signal: AbortSignal) => {
+  const mint = async (scope: GitHubScope, signal: AbortSignal): Promise<InstallationToken> => {
     // Credentials first: a rotation clears the installation ids before one is used.
     await currentCredentials(signal)
     const id = await installationId(scope, signal)
-    return (await asApp(
-      'POST',
-      `${scope.apiUrl}/app/installations/${id}/access_tokens`,
-      signal,
-      narrowedTo(scope),
-    )) as { token: string; expires_at: string }
+    return parseInstallationToken(
+      await asApp(
+        'POST',
+        `${scope.apiUrl}/app/installations/${id}/access_tokens`,
+        signal,
+        narrowedTo(scope),
+      ),
+    )
   }
 
   const tokenFor = async (scope: GitHubScope, signal: AbortSignal): Promise<string> => {
@@ -137,7 +139,7 @@ export function createGitHubAppClient(options: {
     const cached = tokens.get(key)
     if (cached && options.now() < cached.expiresAt - TOKEN_MARGIN_MS) return cached.token
     const knownInstallation = installations.has(key)
-    let minted: { token: string; expires_at: string }
+    let minted: InstallationToken
     try {
       minted = await mint(scope, signal)
     } catch (error) {
@@ -146,7 +148,7 @@ export function createGitHubAppClient(options: {
       installations.delete(key)
       minted = await mint(scope, signal)
     }
-    tokens.set(key, { token: minted.token, expiresAt: Date.parse(minted.expires_at) })
+    tokens.set(key, minted)
     return minted.token
   }
 

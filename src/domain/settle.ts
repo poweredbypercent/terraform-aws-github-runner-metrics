@@ -1,5 +1,5 @@
 import { describeError, err, ok, type Result } from './result.ts'
-import type { PartialResult } from './types.ts'
+import type { ItemFailure, PartialResult } from './types.ts'
 
 /**
  * Running a source so that its failure, or its slowness, stays its own.
@@ -32,9 +32,25 @@ export async function settle<T>(
 }
 
 /**
- * Reads each item on its own, so one that fails (a queue, a GitHub scope) fails alone. `read`
- * returns undefined for an item that turned out not to exist, which is neither a value nor a
- * failure. When every item failed, the source as a whole has failed.
+ * Waits for `work`, but no longer than `signal` allows: for calls that take no signal of their own
+ * (a credential provider), so they cannot outrun the budget they are part of.
+ */
+export function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason)
+    signal.addEventListener('abort', abort, { once: true })
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort))
+  })
+}
+
+/** At most this many distinct reasons are named when every item failed. */
+const REASONS_NAMED = 3
+
+/**
+ * Reads each item on its own, so one that fails (a queue, a GitHub scope) fails alone, keeping why.
+ * `read` returns undefined for an item that turned out not to exist, which is neither a value nor
+ * a failure. When every item failed, the source as a whole has failed, and says why.
  */
 export async function readEach<K, V>(
   items: readonly K[],
@@ -42,19 +58,20 @@ export async function readEach<K, V>(
   read: (item: K) => Promise<V | undefined>,
 ): Promise<PartialResult<V>> {
   const values = new Map<string, V>()
-  const failed: string[] = []
+  const failed: ItemFailure[] = []
   await Promise.all(
     items.map(async item => {
       try {
         const value = await read(item)
         if (value !== undefined) values.set(keyOf(item), value)
-      } catch {
-        failed.push(keyOf(item))
+      } catch (error) {
+        failed.push({ key: keyOf(item), error: describeError(error) })
       }
     }),
   )
   if (failed.length > 0 && values.size === 0) {
-    throw new Error(`none of ${failed.length} could be read`)
+    const reasons = [...new Set(failed.map(f => f.error))].slice(0, REASONS_NAMED)
+    throw new Error(`none of ${failed.length} could be read: ${reasons.join('; ')}`)
   }
   return { values, failed }
 }

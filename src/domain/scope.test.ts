@@ -1,12 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import {
-  instanceIdOfRunnerName,
-  scopeApiPath,
-  scopeFromTags,
-  scopeKey,
-  scopeOwnerName,
-} from './scope.ts'
+import { instanceIdOfRunnerName, scopeFromTags, scopeKey, scopeOwnerName } from './scope.ts'
 
 const API = 'https://api.github.com'
 
@@ -56,17 +50,12 @@ describe('scopeFromTags', () => {
   })
 })
 
-describe('scope keys, names and paths', () => {
+describe('scope keys and names', () => {
   const repo = { type: 'repo', owner: 'acme', repo: 'widgets', apiUrl: API } as const
 
   it('keys a scope by API host, type and target', () => {
     assert.equal(scopeKey(repo), 'https://api.github.com|repo|acme/widgets')
     assert.equal(scopeOwnerName(repo), 'acme/widgets')
-  })
-
-  it('builds the REST path for an organisation or a repository', () => {
-    assert.equal(scopeApiPath(repo), '/repos/acme/widgets')
-    assert.equal(scopeApiPath({ type: 'org', owner: 'acme', apiUrl: API }), '/orgs/acme')
   })
 })
 

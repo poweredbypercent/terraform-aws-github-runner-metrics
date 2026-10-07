@@ -1,5 +1,6 @@
 # terraform test, against a mock AWS provider: how the module reads runner stacks, what it hands
-# the Lambda, and which permissions it grants. Needs Terraform >= 1.11 (override_during).
+# the Lambda, which permissions it grants, and what it refuses. Needs Terraform >= 1.7 (mocks);
+# the one run that needs 1.11 is in created_secret.tftest.hcl.
 
 mock_provider "aws" {
   override_data {
@@ -23,8 +24,49 @@ mock_provider "aws" {
 
 variables {
   remote_write = { url = "https://prometheus.example/api/v1/write" }
-  lambda_zip   = { s3 = { bucket = "artifacts", key = "runner-metrics.zip" } }
+  lambda_zip   = { s3 = { bucket = "artifacts", key = "runner-metrics.zip", object_version = "v1" } }
   github_app   = { source = "disabled" }
+}
+
+# The CONFIG contract: exactly what src/config/contract.test.ts shows the Lambda reads.
+run "renders_the_configuration_the_lambda_reads" {
+  command = plan
+
+  variables {
+    runner_stacks = [{
+      multi_runner = {
+        linux = { lambda_up = { environment = [{ variables = {
+          ENVIRONMENT           = "ci-linux"
+          RUNNERS_MAXIMUM_COUNT = "20"
+          RUNNER_NAME_PREFIX    = "linux"
+        } }] } }
+      }
+      labels = { team = "platform" }
+    }]
+    runner_configs = {
+      fifo = {
+        environment    = "ci-fifo"
+        github_api_url = "https://ghes.example/api/v3"
+        queues         = { main = "arn:aws:sqs:eu-west-1:123456789012:ci-fifo-queued-builds.fifo" }
+      }
+    }
+    labels = { cluster = "ci" }
+    github_app = {
+      source     = "existing_secret"
+      secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-app-AbCdEf"
+      owners     = ["acme"]
+    }
+    remote_write = {
+      url     = "https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-1/api/v1/remote_write"
+      auth    = { sigv4 = { role_arn = "arn:aws:iam::210987654321:role/prometheus-writer", external_id = "metrics" } }
+      headers = { "X-Scope-OrgID" = "ci" }
+    }
+  }
+
+  assert {
+    condition     = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG) == jsondecode(file("src/test/config.v1.json"))
+    error_message = "CONFIG differs from src/test/config.v1.json, which the Lambda's contract test parses. It is now: ${aws_lambda_function.this.environment[0].variables.CONFIG}"
+  }
 }
 
 # The shape of the runner module's outputs: each runner config's scale-up Lambda, whose
@@ -43,6 +85,7 @@ run "reads_a_multi_runner_stack" {
         ghes = { lambda_up = { environment = [{ variables = {
           ENVIRONMENT           = "ci-ghes"
           RUNNERS_MAXIMUM_COUNT = "-1"
+          RUNNER_NAME_PREFIX    = ""
           GHES_URL              = "https://github.example.com/"
         } }] } }
       }
@@ -55,10 +98,10 @@ run "reads_a_multi_runner_stack" {
     error_message = "environment and cap come from the scale-up Lambda"
   }
   assert {
-    condition = jsonencode(output.runner_configs.linux.queue_arns) == jsonencode([
-      "arn:aws:sqs:eu-west-1:123456789012:ci-linux-queued-builds",
-      "arn:aws:sqs:eu-west-1:123456789012:ci-linux-queued-builds_dead_letter",
-    ])
+    condition = output.runner_configs.linux.queues == {
+      main        = "arn:aws:sqs:eu-west-1:123456789012:ci-linux-queued-builds"
+      dead_letter = "arn:aws:sqs:eu-west-1:123456789012:ci-linux-queued-builds_dead_letter"
+    }
     error_message = "queues are derived from the environment in this account and region"
   }
   assert {
@@ -82,8 +125,10 @@ run "reads_a_root_module_stack_with_its_queues" {
     runner_stacks = [{
       name = "ci"
       runners = { lambda_up = { environment = [{ variables = {
-        ENVIRONMENT = "ci"
-        GHES_URL    = "https://acme.ghe.com"
+        ENVIRONMENT           = "ci"
+        RUNNERS_MAXIMUM_COUNT = "8"
+        RUNNER_NAME_PREFIX    = ""
+        GHES_URL              = "https://acme.ghe.com"
       } }] } }
       queues = {
         build_queue_arn     = "arn:aws:sqs:eu-west-1:123456789012:ci-queued-builds"
@@ -93,8 +138,12 @@ run "reads_a_root_module_stack_with_its_queues" {
   }
 
   assert {
-    condition     = jsonencode(output.runner_configs.ci.queue_arns) == jsonencode(["arn:aws:sqs:eu-west-1:123456789012:ci-queued-builds"])
+    condition     = output.runner_configs.ci.queues.main == "arn:aws:sqs:eu-west-1:123456789012:ci-queued-builds" && output.runner_configs.ci.queues.dead_letter == null
     error_message = "the root module's queue outputs are used as they are"
+  }
+  assert {
+    condition     = length(jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG).runner_configs[0].queues) == 1
+    error_message = "no dead-letter queue is handed to the Lambda when the stack has none"
   }
   assert {
     condition     = output.runner_configs.ci.github_api_url == "https://api.acme.ghe.com"
@@ -117,27 +166,33 @@ run "hands_the_lambda_its_configuration" {
   }
 
   assert {
-    condition     = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG).version == 1
-    error_message = "the configuration is versioned for the Lambda's parser"
-  }
-  assert {
-    condition = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG).remote_write.auth == {
-      type         = "sigv4"
-      region       = "eu-west-1"
-      service      = "aps"
-      role_arn     = "arn:aws:iam::210987654321:role/prometheus-writer"
-      external_id  = null
-      session_name = "github-runner-metrics-123456789012"
-    }
-    error_message = "SigV4 takes its region from the AMP URL, and names the deployment in its session"
-  }
-  assert {
     condition     = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG).github.credentials == { type = "none" }
     error_message = "disabled GitHub means no credentials"
   }
   assert {
     condition     = aws_lambda_function_event_invoke_config.this.maximum_retry_attempts == 0
     error_message = "a failed sample is never retried out of order"
+  }
+  assert {
+    condition     = aws_lambda_function.this.s3_object_version == "v1"
+    error_message = "an S3 zip is deployed by its pinned version"
+  }
+}
+
+run "takes_the_region_from_an_amp_vpc_endpoint" {
+  command = plan
+
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write = {
+      url  = "https://vpce-0abc-xyz.aps-workspaces.us-east-1.vpce.amazonaws.com/workspaces/ws-1/api/v1/remote_write"
+      auth = { sigv4 = {} }
+    }
+  }
+
+  assert {
+    condition     = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG).remote_write.auth.region == "us-east-1"
+    error_message = "the region is read from the endpoint's hostname, not the vpce label"
   }
 }
 
@@ -164,89 +219,12 @@ run "grants_only_what_the_features_need" {
     condition     = length(aws_secretsmanager_secret.github_app) == 0
     error_message = "no App secret when GitHub is disabled"
   }
-}
-
-run "creates_the_app_secret_by_default" {
-  command = plan
-
-  variables {
-    runner_configs = { ci = { environment = "ci" } }
-    github_app     = { owners = ["acme"] }
-  }
-
-  # The created secret's ARN is only known after apply; give the plan one.
-  override_resource {
-    target          = aws_secretsmanager_secret.github_app
-    override_during = plan
-    values          = { arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-runner-metrics/github-app-AbCdEf" }
-  }
-
   assert {
-    condition     = length(aws_secretsmanager_secret.github_app) == 1
-    error_message = "create_secret is the default"
-  }
-  assert {
-    condition     = contains(flatten([for s in data.aws_iam_policy_document.lambda.statement : s.actions]), "secretsmanager:GetSecretValue")
-    error_message = "the created secret can be read"
-  }
-}
-
-run "rejects_a_stack_given_both_ways" {
-  command = plan
-  variables {
-    runner_stacks = [{ multi_runner = {}, runners = {} }]
-  }
-  expect_failures = [var.runner_stacks]
-}
-
-run "rejects_two_remote_write_auths" {
-  command = plan
-  variables {
-    runner_configs = { ci = { environment = "ci" } }
-    remote_write = {
-      url  = "https://prometheus.example/api/v1/write"
-      auth = { basic = { secret_arn = "a" }, bearer = { secret_arn = "b" } }
-    }
-  }
-  expect_failures = [var.remote_write]
-}
-
-run "rejects_a_remote_write_header_that_would_override_auth" {
-  command = plan
-  variables {
-    runner_configs = { ci = { environment = "ci" } }
-    remote_write   = { url = "https://prometheus.example/api/v1/write", headers = { Authorization = "Bearer x" } }
-  }
-  expect_failures = [var.remote_write]
-}
-
-run "rejects_a_zip_given_both_ways" {
-  command = plan
-  variables {
-    runner_configs = { ci = { environment = "ci" } }
-    lambda_zip     = { path = "lambda.zip", s3 = { bucket = "b", key = "k" } }
-  }
-  expect_failures = [var.lambda_zip]
-}
-
-run "explicit_runner_configs_find_the_github_api_the_same_way" {
-  command = plan
-
-  variables {
-    github_enterprise_server_url = "https://acme.ghe.com"
-    runner_configs = {
-      data_residency = { environment = "ci" }
-      own_api        = { environment = "ci-own", github_api_url = "https://ghes.example/api/v3/" }
-    }
-  }
-
-  assert {
-    condition     = output.runner_configs.data_residency.github_api_url == "https://api.acme.ghe.com"
-    error_message = "GHE.com is an api. subdomain whichever way the runner config was given"
-  }
-  assert {
-    condition     = output.runner_configs.own_api.github_api_url == "https://ghes.example/api/v3"
-    error_message = "an explicit API URL is used as given, without its trailing slash"
+    condition = jsonencode(flatten([
+      for s in data.aws_iam_policy_document.lambda.statement : [for c in s.condition : c.values if c.variable == "aws:RequestedRegion"]
+      if contains(s.actions, "ec2:DescribeInstances")
+    ])) == jsonencode(["eu-west-1"])
+    error_message = "the unscoped reads are limited to the module's region"
   }
 }
 
@@ -258,7 +236,9 @@ run "reads_the_runner_module_app_from_ssm" {
     runner_stacks = [{
       multi_runner = {
         linux = { lambda_up = { environment = [{ variables = {
-          ENVIRONMENT = "ci-linux"
+          ENVIRONMENT           = "ci-linux"
+          RUNNERS_MAXIMUM_COUNT = "20"
+          RUNNER_NAME_PREFIX    = ""
           # v7.11 joins the parameters of several Apps with ":".
           PARAMETER_GITHUB_APP_ID_NAME         = "/gh/app-id:/gh/second-app-id"
           PARAMETER_GITHUB_APP_KEY_BASE64_NAME = "/gh/app-key:/gh/second-app-key"
@@ -282,15 +262,6 @@ run "reads_the_runner_module_app_from_ssm" {
     )
     error_message = "the role can read exactly those parameters"
   }
-}
-
-run "warns_when_the_runner_module_app_cannot_be_found" {
-  command = plan
-  variables {
-    github_app     = { source = "runner_ssm", owners = ["acme"] }
-    runner_configs = { ci = { environment = "ci" } }
-  }
-  expect_failures = [check.github_app]
 }
 
 run "reads_an_existing_secret_through_its_key_only" {
@@ -322,6 +293,27 @@ run "reads_an_existing_secret_through_its_key_only" {
   }
 }
 
+run "explicit_runner_configs_find_the_github_api_the_same_way" {
+  command = plan
+
+  variables {
+    github_enterprise_server_url = "https://acme.ghe.com"
+    runner_configs = {
+      data_residency = { environment = "ci" }
+      own_api        = { environment = "ci-own", github_api_url = "https://ghes.example/api/v3/" }
+    }
+  }
+
+  assert {
+    condition     = output.runner_configs.data_residency.github_api_url == "https://api.acme.ghe.com"
+    error_message = "GHE.com is an api. subdomain whichever way the runner config was given"
+  }
+  assert {
+    condition     = output.runner_configs.own_api.github_api_url == "https://ghes.example/api/v3"
+    error_message = "an explicit API URL is used as given, without its trailing slash"
+  }
+}
+
 run "takes_a_hash_without_reading_the_zip" {
   command = plan
 
@@ -336,23 +328,196 @@ run "takes_a_hash_without_reading_the_zip" {
   }
 }
 
+# Degradations: they warn.
+
 run "warns_about_a_queue_in_another_region" {
   command = plan
   variables {
     runner_configs = {
-      ci = { environment = "ci", queue_arns = ["arn:aws:sqs:us-east-1:123456789012:ci-queued-builds"] }
+      ci = { environment = "ci", queues = { main = "arn:aws:sqs:us-east-1:123456789012:ci-queued-builds" } }
     }
   }
   expect_failures = [check.runner_configs]
 }
 
-run "warns_when_the_timeout_cannot_fit_a_slow_sample" {
+run "warns_about_a_runner_module_it_does_not_know" {
+  command = plan
+  variables {
+    runner_stacks = [{ multi_runner = { linux = { lambda_up = { environment = [{ variables = { ENVIRONMENT = "ci-linux" } }] } } } }]
+  }
+  expect_failures = [check.runner_configs]
+}
+
+# What the Lambda would reject on every invocation: refused before it is deployed.
+
+run "rejects_a_runner_config_name_in_two_stacks" {
+  command = plan
+  variables {
+    runner_stacks = [
+      { multi_runner = { linux = { lambda_up = { environment = [{ variables = { ENVIRONMENT = "a-linux", RUNNERS_MAXIMUM_COUNT = "1", RUNNER_NAME_PREFIX = "" } }] } } } },
+      { multi_runner = { linux = { lambda_up = { environment = [{ variables = { ENVIRONMENT = "b-linux", RUNNERS_MAXIMUM_COUNT = "1", RUNNER_NAME_PREFIX = "" } }] } } } },
+    ]
+  }
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "rejects_one_environment_sampled_twice" {
+  command = plan
+  variables {
+    runner_stacks  = [{ multi_runner = { linux = { lambda_up = { environment = [{ variables = { ENVIRONMENT = "ci-linux", RUNNERS_MAXIMUM_COUNT = "1", RUNNER_NAME_PREFIX = "" } }] } } } }]
+    runner_configs = { linux-fifo = { environment = "ci-linux" } }
+  }
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "rejects_a_stack_without_an_environment" {
+  command = plan
+  variables {
+    runner_stacks = [{ multi_runner = { linux = { lambda_up = { environment = [{ variables = { RUNNERS_MAXIMUM_COUNT = "1", RUNNER_NAME_PREFIX = "" } }] } } } }]
+  }
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "rejects_a_plain_http_github_from_a_stack" {
+  command = plan
+  variables {
+    runner_stacks = [{ multi_runner = { linux = { lambda_up = { environment = [{ variables = {
+      ENVIRONMENT = "ci-linux", RUNNERS_MAXIMUM_COUNT = "1", RUNNER_NAME_PREFIX = "", GHES_URL = "http://ghes.example"
+    } }] } } } }]
+  }
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "rejects_a_built_in_label_on_a_runner_config" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci", labels = { environment = "prod" } } }
+  }
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "rejects_an_empty_label_value" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    labels         = { team = "" }
+  }
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "rejects_when_the_runner_module_app_cannot_be_found" {
+  command = plan
+  variables {
+    github_app     = { source = "runner_ssm", owners = ["acme"] }
+    runner_configs = { ci = { environment = "ci" } }
+  }
+  expect_failures = [aws_lambda_function.this]
+}
+
+run "rejects_a_timeout_that_cannot_fit_a_slow_sample" {
   command = plan
   variables {
     runner_configs = { ci = { environment = "ci" } }
     lambda_timeout = 20
   }
-  expect_failures = [check.timeout_budget]
+  expect_failures = [aws_lambda_function.this]
+}
+
+# Inputs that are wrong whatever else is set.
+
+run "rejects_a_stack_given_both_ways" {
+  command = plan
+  variables {
+    runner_stacks = [{ multi_runner = {}, runners = {} }]
+  }
+  expect_failures = [var.runner_stacks]
+}
+
+run "rejects_an_unnamed_root_module_stack" {
+  command = plan
+  variables {
+    runner_stacks = [{ runners = { lambda_up = { environment = [{ variables = { ENVIRONMENT = "ci" } }] } } }]
+  }
+  expect_failures = [var.runner_stacks]
+}
+
+run "rejects_a_wildcard_queue" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci", queues = { main = "arn:aws:sqs:eu-west-1:123456789012:*" } } }
+  }
+  expect_failures = [var.runner_configs]
+}
+
+run "rejects_a_runner_cap_out_of_range" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci", max_runners = -2 } }
+  }
+  expect_failures = [var.runner_configs]
+}
+
+run "rejects_two_remote_write_auths" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write = {
+      url = "https://prometheus.example/api/v1/write"
+      auth = {
+        basic  = { secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:basic-AbCdEf" }
+        bearer = { secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:bearer-AbCdEf" }
+      }
+    }
+  }
+  expect_failures = [var.remote_write]
+}
+
+run "rejects_a_wildcard_writer_role" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write = {
+      url  = "https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-1/api/v1/remote_write"
+      auth = { sigv4 = { role_arn = "arn:aws:iam::210987654321:role/*" } }
+    }
+  }
+  expect_failures = [var.remote_write]
+}
+
+run "rejects_a_remote_write_header_that_would_override_auth" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write   = { url = "https://prometheus.example/api/v1/write", headers = { Authorization = "Bearer x" } }
+  }
+  expect_failures = [var.remote_write]
+}
+
+run "rejects_a_credential_in_a_plain_header" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write   = { url = "https://prometheus.example/api/v1/write", headers = { "X-Api-Key" = "s3cr3t" } }
+  }
+  expect_failures = [var.remote_write]
+}
+
+run "rejects_a_zip_given_both_ways" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    lambda_zip     = { path = "lambda.zip", s3 = { bucket = "b", key = "k", object_version = "v1" } }
+  }
+  expect_failures = [var.lambda_zip]
+}
+
+run "rejects_a_rate_eventbridge_rejects" {
+  command = plan
+  variables {
+    runner_configs      = { ci = { environment = "ci" } }
+    schedule_expression = "rate(1 minutes)"
+  }
+  expect_failures = [var.schedule_expression]
 }
 
 run "rejects_a_wildcard_secret_arn" {
@@ -371,17 +536,6 @@ run "requires_an_owners_allowlist_with_github" {
     github_app     = {}
   }
   expect_failures = [var.github_app]
-}
-
-run "warns_about_a_runner_config_name_in_two_stacks" {
-  command = plan
-  variables {
-    runner_stacks = [
-      { multi_runner = { linux = { lambda_up = { environment = [{ variables = { ENVIRONMENT = "a-linux" } }] } } } },
-      { multi_runner = { linux = { lambda_up = { environment = [{ variables = { ENVIRONMENT = "b-linux" } }] } } } },
-    ]
-  }
-  expect_failures = [check.runner_configs]
 }
 
 run "rejects_credentials_over_plain_http" {

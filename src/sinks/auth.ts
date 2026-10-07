@@ -4,6 +4,7 @@ import { SignatureV4 } from '@smithy/signature-v4'
 import type { AwsCredentialIdentity, Checksum, SourceData } from '@smithy/types'
 import type { Cached } from '../cache.ts'
 import type { RemoteWriteAuth, SigV4Auth } from '../config/types.ts'
+import { untilAborted } from '../domain/settle.ts'
 
 /**
  * How a remote-write request is authenticated. Each strategy turns the final request (body
@@ -56,21 +57,57 @@ class Sha256 implements Checksum {
 
 const nothingCached = (): void => {}
 
-/** SigV4 with the AWS SDK's own signer; credentials come from a provider that caches and refreshes. */
+export type CredentialProvider = () => Promise<AwsCredentialIdentity>
+
+/** Credentials are refreshed this long before they expire. */
+const CREDENTIAL_REFRESH_MARGIN_MS = 5 * 60_000
+
+/**
+ * A provider that keeps its credentials until shortly before they expire. The SDK's assume-role
+ * provider does not cache by itself (its clients do, around it), and called straight from the
+ * signer it would call STS on every push. Concurrent callers share one refresh.
+ */
+export function refreshingCredentials(
+  provider: CredentialProvider,
+  now: () => number = Date.now,
+): CredentialProvider {
+  let current: AwsCredentialIdentity | undefined
+  let refreshing: Promise<AwsCredentialIdentity> | undefined
+  const fresh = (c: AwsCredentialIdentity) =>
+    c.expiration === undefined || c.expiration.getTime() - now() > CREDENTIAL_REFRESH_MARGIN_MS
+  return async () => {
+    if (current && fresh(current)) return current
+    refreshing ??= provider()
+      .then(credentials => {
+        current = credentials
+        return credentials
+      })
+      .finally(() => {
+        refreshing = undefined
+      })
+    return refreshing
+  }
+}
+
+/**
+ * SigV4 with the AWS SDK's own signer. Getting the credentials (an STS call, when a writer role is
+ * assumed) comes out of the push's own budget: it takes the push's signal, so a hung call cannot
+ * run on to the Lambda's timeout.
+ */
 export function sigv4Auth(options: {
   region: string
   service: string
-  credentials: () => Promise<AwsCredentialIdentity>
+  credentials: CredentialProvider
   now?: () => Date
 }): Auth {
-  const signer = new SignatureV4({
-    region: options.region,
-    service: options.service,
-    credentials: options.credentials,
-    sha256: Sha256,
-  })
   return {
-    async sign(request) {
+    async sign(request, signal) {
+      const signer = new SignatureV4({
+        region: options.region,
+        service: options.service,
+        credentials: await untilAborted(options.credentials(), signal),
+        sha256: Sha256,
+      })
       const url = new URL(request.url)
       const signed = await signer.sign(
         new HttpRequest({
@@ -93,16 +130,30 @@ export function sigv4Auth(options: {
 /** A secret's value, read when needed and cached; undefined until someone fills it in. */
 export type SecretValue = Cached<string>
 
-async function secretJson(secret: SecretValue, signal: AbortSignal) {
+/** The secret's fields when it is a JSON object; otherwise it is a bare token. */
+async function secretFields(
+  secret: SecretValue,
+  signal: AbortSignal,
+): Promise<Readonly<Record<string, unknown>>> {
   const raw = await secret.get(signal)
   if (!raw) throw new Error('the remote-write secret has no value yet')
+  let parsed: unknown
   try {
-    return JSON.parse(raw) as Record<string, unknown>
+    parsed = JSON.parse(raw)
   } catch {
-    // A bearer secret may be the bare token.
-    return { token: raw.trim() }
+    parsed = undefined
   }
+  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return parsed as Readonly<Record<string, unknown>>
+  }
+  return { token: raw.trim() }
 }
+
+/**
+ * Visible ASCII only. A token with a line break or control character in it (a wrapped paste)
+ * would make fetch reject the header, and its error message would quote the value.
+ */
+const TOKEN = /^[\x21-\x7e]+$/
 
 const withAuthorization = (request: UnsignedRequest, authorization: string) => ({
   ...request.headers,
@@ -112,7 +163,7 @@ const withAuthorization = (request: UnsignedRequest, authorization: string) => (
 export function basicAuth(secret: SecretValue): Auth {
   return {
     async sign(request, signal) {
-      const { username, password } = await secretJson(secret, signal)
+      const { username, password } = await secretFields(secret, signal)
       if (typeof username !== 'string' || typeof password !== 'string') {
         throw new Error('basic auth secret needs {"username": "...", "password": "..."}')
       }
@@ -126,9 +177,11 @@ export function basicAuth(secret: SecretValue): Auth {
 export function bearerAuth(secret: SecretValue): Auth {
   return {
     async sign(request, signal) {
-      const { token } = await secretJson(secret, signal)
-      if (typeof token !== 'string' || token === '') {
-        throw new Error('bearer auth secret needs {"token": "..."} or the bare token')
+      const { token } = await secretFields(secret, signal)
+      if (typeof token !== 'string' || !TOKEN.test(token)) {
+        throw new Error(
+          'bearer auth secret needs {"token": "..."} or the bare token, printable and on one line',
+        )
       }
       return withAuthorization(request, `Bearer ${token}`)
     },
@@ -145,7 +198,7 @@ export function authFromConfig(
   auth: RemoteWriteAuth,
   deps: {
     secret: (arn: string) => SecretValue
-    credentialsFor: (auth: SigV4Auth) => () => Promise<AwsCredentialIdentity>
+    credentialsFor: (auth: SigV4Auth) => CredentialProvider
   },
 ): Auth {
   switch (auth.type) {

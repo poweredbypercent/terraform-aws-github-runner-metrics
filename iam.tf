@@ -1,3 +1,17 @@
+# What the role may read, generated from the inputs: a statement exists only when its feature is
+# used, and names exactly the queues, secrets, parameters and keys in the configuration.
+locals {
+  queue_arns = distinct(compact(flatten([
+    for c in values(local.runner_configs) : [c.queues.main, c.queues.dead_letter]
+  ])))
+  secret_arns = compact([local.github_secret_arn, local.remote_write_secret_arn])
+  ssm_parameter_arns = local.github_ssm_parameters == null ? [] : [
+    for name in compact(values(local.github_ssm_parameters)) :
+    "arn:${local.partition}:ssm:${local.region}:${local.account}:parameter/${trimprefix(name, "/")}"
+  ]
+  kms_key_arns = distinct(compact(concat([var.kms_key_arn], var.secrets_kms_key_arns)))
+}
+
 data "aws_iam_policy_document" "assume" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -19,8 +33,6 @@ resource "aws_iam_role" "lambda" {
   tags                 = var.tags
 }
 
-
-# Least privilege, generated from the inputs: a statement exists only when its feature is used.
 data "aws_iam_policy_document" "lambda" {
   statement {
     sid       = "AllowWriteLogs"
@@ -28,7 +40,8 @@ data "aws_iam_policy_document" "lambda" {
     resources = ["${aws_cloudwatch_log_group.lambda.arn}:*"]
   }
 
-  # An empty resource list is an invalid policy; checks.tf reports the missing runner configs.
+  # An empty resource list is an invalid policy; a precondition (main.tf) reports the missing
+  # runner configs.
   dynamic "statement" {
     for_each = length(local.queue_arns) > 0 ? [1] : []
     content {
@@ -39,10 +52,16 @@ data "aws_iam_policy_document" "lambda" {
   }
 
   statement {
-    # GetMetricData and DescribeInstances support no resource-level permissions.
+    # GetMetricData and DescribeInstances support no resource-level permissions; the region they
+    # are asked in can be limited, to the one this module samples.
     sid       = "AllowReadQueueAgeAndRunnerInstances"
     actions   = ["cloudwatch:GetMetricData", "ec2:DescribeInstances"]
     resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [local.region]
+    }
   }
 
   dynamic "statement" {

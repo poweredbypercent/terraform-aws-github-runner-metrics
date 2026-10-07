@@ -13,12 +13,29 @@ export type SourceName = 'sqs' | 'cloudwatch' | 'ec2' | 'github'
 /** Which sources answered this sample; a source that is not configured is absent. */
 export type SourceHealth = { readonly [S in SourceName]?: boolean }
 
-/** One of a runner config's scale-up queues, as configured (ARN) and as SQS addresses it (URL). */
+/** One of a runner config's scale-up queues. Its kind is configured, never guessed from its name. */
 export interface QueueRef {
   readonly arn: string
+  /** The queue's name, as CloudWatch's QueueName dimension knows it (FIFO queues end in .fifo). */
   readonly name: string
-  readonly url: string
   readonly kind: QueueKind
+}
+
+/** One runner config of a runner stack: what the runner module calls a "runner" in multi_runner_config. */
+export interface RunnerConfig {
+  /** The `runner_config` label: the multi-runner key, or the stack's name. */
+  readonly name: string
+  /** The `environment` label and the ghr:environment tag value: `<prefix>` or `<prefix>-<key>`. */
+  readonly environment: string
+  /** runners_maximum_count; null when unlimited, and then no capacity series is reported. */
+  readonly maxRunners: number | null
+  readonly runnerNamePrefix: string
+  /** GitHub REST API base for this stack (GitHub Enterprise Server sets its own). */
+  readonly githubApiUrl: string
+  /** Exactly one main queue, and at most one dead-letter queue. */
+  readonly queues: readonly QueueRef[]
+  /** Constant labels for this runner config's series only. */
+  readonly labels: Readonly<Record<string, string>>
 }
 
 export interface QueueDepth {
@@ -61,10 +78,16 @@ export interface RegisteredRunner {
   readonly scope: GitHubScope
 }
 
+/** An item (a queue, a scope) that could not be read, and why. */
+export interface ItemFailure {
+  readonly key: string
+  readonly error: string
+}
+
 /** Results read item by item (per queue, per scope): what was read, keyed, and what failed. */
 export interface PartialResult<V> {
   readonly values: ReadonlyMap<string, V>
-  readonly failed: readonly string[]
+  readonly failed: readonly ItemFailure[]
 }
 
 export interface Snapshot {

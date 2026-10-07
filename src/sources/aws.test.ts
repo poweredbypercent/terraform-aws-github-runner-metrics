@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import type { Instance } from '@aws-sdk/client-ec2'
-import { queueArn as ARN, signal, testConfig } from '../test/fixtures.ts'
+import { queueArn as ARN, queuesOf, signal, testConfig } from '../test/fixtures.ts'
 import { readInstances, readQueueAges, readQueueDepths } from './aws.ts'
 
 const { runnerConfigs } = testConfig({
@@ -9,27 +9,29 @@ const { runnerConfigs } = testConfig({
     {
       name: 'linux',
       environment: 'ci-linux',
-      queue_arns: [ARN('ci-linux-queued-builds'), ARN('ci-linux-queued-builds_dead_letter')],
+      queues: queuesOf('ci-linux-queued-builds', 'ci-linux-queued-builds_dead_letter'),
     },
     {
       name: 'ghes',
       environment: 'ci-ghes',
       github_api_url: 'https://ghes.example/api/v3',
-      queue_arns: [ARN('ci-ghes-queued-builds')],
+      queues: queuesOf('ci-ghes-queued-builds'),
     },
   ],
 })
 
+const DEPTH = {
+  ApproximateNumberOfMessages: '3',
+  ApproximateNumberOfMessagesNotVisible: '1',
+  ApproximateNumberOfMessagesDelayed: '0',
+}
+
 describe('readQueueDepths', () => {
-  it('reads every queue, and lets a queue that fails fail alone', async () => {
+  it('reads every queue, and lets a queue that fails fail alone, saying why', async () => {
     const depths = await readQueueDepths(
-      async url => {
-        if (url.endsWith('_dead_letter')) throw new Error('AccessDenied')
-        return {
-          ApproximateNumberOfMessages: '3',
-          ApproximateNumberOfMessagesNotVisible: '1',
-          ApproximateNumberOfMessagesDelayed: '0',
-        }
+      async arn => {
+        if (arn.endsWith('_dead_letter')) throw new Error('AccessDenied')
+        return DEPTH
       },
       runnerConfigs,
       signal,
@@ -39,27 +41,38 @@ describe('readQueueDepths', () => {
       inFlight: 1,
       delayed: 0,
     })
-    assert.deepEqual(depths.failed, [ARN('ci-linux-queued-builds_dead_letter')])
+    assert.deepEqual(depths.failed, [
+      { key: ARN('ci-linux-queued-builds_dead_letter'), error: 'AccessDenied' },
+    ])
   })
 
-  it('treats a dead-letter queue that does not exist as absent, not failed', async () => {
+  it('treats a dead-letter queue that does not exist as absent, and a main one as failed', async () => {
     const depths = await readQueueDepths(
-      async url => {
-        if (url.endsWith('_dead_letter')) {
-          throw Object.assign(new Error('The specified queue does not exist.'), {
-            name: 'QueueDoesNotExist',
-          })
-        }
-        return { ApproximateNumberOfMessages: '0' }
-      },
+      async arn => (arn.endsWith('_dead_letter') || arn.includes('ghes') ? undefined : DEPTH),
       runnerConfigs,
       signal,
     )
-    assert.deepEqual(depths.failed, [])
     assert.equal(depths.values.has(ARN('ci-linux-queued-builds_dead_letter')), false)
+    assert.deepEqual(depths.failed, [
+      { key: ARN('ci-ghes-queued-builds'), error: 'queue ci-ghes-queued-builds does not exist' },
+    ])
   })
 
-  it('fails the source when no queue could be read', async () => {
+  it('fails a queue whose attributes SQS did not return, rather than reading zero', async () => {
+    const depths = await readQueueDepths(
+      async arn => (arn.includes('ghes') ? { ApproximateNumberOfMessages: '2' } : DEPTH),
+      runnerConfigs,
+      signal,
+    )
+    assert.deepEqual(depths.failed, [
+      {
+        key: ARN('ci-ghes-queued-builds'),
+        error: 'SQS returned no ApproximateNumberOfMessagesNotVisible',
+      },
+    ])
+  })
+
+  it('fails the source when no queue could be read, naming why', async () => {
     await assert.rejects(
       readQueueDepths(
         async () => {
@@ -68,7 +81,7 @@ describe('readQueueDepths', () => {
         runnerConfigs,
         signal,
       ),
-      /none of 3 could be read/,
+      /none of 3 could be read: AccessDenied/,
     )
   })
 })

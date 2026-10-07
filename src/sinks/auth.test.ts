@@ -1,7 +1,15 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { cachedForTest, signal } from '../test/fixtures.ts'
-import { authFromConfig, basicAuth, bearerAuth, noAuth, sigv4Auth } from './auth.ts'
+import type { AwsCredentialIdentity } from '@smithy/types'
+import { abortsAfter, cachedForTest, signal } from '../test/fixtures.ts'
+import {
+  authFromConfig,
+  basicAuth,
+  bearerAuth,
+  noAuth,
+  refreshingCredentials,
+  sigv4Auth,
+} from './auth.ts'
 
 const AMP =
   'https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-5f5eaea4-b91f-42ef-9ecb-72c3853cdf57/api/v1/remote_write'
@@ -36,6 +44,60 @@ describe('sigv4Auth', () => {
     )
     assert.equal(headers['x-amz-security-token'], 'SESSIONTOKEN')
   })
+
+  it('stops waiting for credentials when the push runs out of time', async () => {
+    const auth = sigv4Auth({
+      region: 'eu-west-1',
+      service: 'aps',
+      credentials: () => new Promise(() => {}),
+    })
+    await assert.rejects(auth.sign(request, abortsAfter(10)), /aborted after 10ms/)
+  })
+})
+
+describe('refreshingCredentials', () => {
+  const issued = (expiresAt: number): AwsCredentialIdentity => ({
+    accessKeyId: `AK${expiresAt}`,
+    secretAccessKey: 's',
+    expiration: new Date(expiresAt),
+  })
+
+  it('keeps credentials until shortly before they expire, sharing one refresh', async () => {
+    let now = 0
+    let calls = 0
+    const provider = refreshingCredentials(
+      async () => issued(now + 15 * 60_000 + calls++),
+      () => now,
+    )
+    const [a, b] = await Promise.all([provider(), provider()])
+    assert.equal(calls, 1, 'concurrent callers share one call')
+    assert.equal(a, b)
+    now = 9 * 60_000
+    await provider()
+    assert.equal(calls, 1, 'still more than five minutes to go')
+    now = 11 * 60_000
+    await provider()
+    assert.equal(calls, 2)
+  })
+
+  it('keeps credentials that do not expire, and tries again after a failure', async () => {
+    let calls = 0
+    const stable = refreshingCredentials(async () => {
+      calls++
+      return { accessKeyId: 'AK', secretAccessKey: 's' }
+    })
+    await stable()
+    await stable()
+    assert.equal(calls, 1)
+    let fail = true
+    const flaky = refreshingCredentials(async () => {
+      if (fail) throw new Error('sts down')
+      return { accessKeyId: 'AK', secretAccessKey: 's' }
+    })
+    await assert.rejects(flaky(), /sts down/)
+    fail = false
+    assert.equal((await flaky()).accessKeyId, 'AK')
+  })
 })
 
 describe('basic and bearer auth', () => {
@@ -49,6 +111,9 @@ describe('basic and bearer auth', () => {
     assert.equal(bearer.authorization, 'Bearer abc')
     const bare = await bearerAuth(secret('abc\n')).sign(request, signal)
     assert.equal(bare.authorization, 'Bearer abc')
+    // A bare token that happens to parse as JSON is still the bare token.
+    const numeric = await bearerAuth(secret('12345')).sign(request, signal)
+    assert.equal(numeric.authorization, 'Bearer 12345')
   })
 
   it('fails clearly on an empty or malformed secret, without echoing it', async () => {
@@ -57,6 +122,13 @@ describe('basic and bearer auth', () => {
       basicAuth(secret('{"username":"u"}')).sign(request, signal),
       /needs \{"username": "...", "password": "..."\}/,
     )
+    for (const token of ['zq\nzq', 'zq zq', '']) {
+      await assert.rejects(
+        bearerAuth(secret(JSON.stringify({ token }))).sign(request, signal),
+        (error: Error) =>
+          /printable and on one line/.test(error.message) && !error.message.includes('zq'),
+      )
+    }
   })
 
   it('reads the secret again once the receiver has refused it', async () => {

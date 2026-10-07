@@ -2,10 +2,9 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { scopeKey } from './domain/scope.ts'
 import type { RunnerInstance } from './domain/types.ts'
-import type { Logger } from './log.ts'
 import { PREFIX, type Sample } from './model/catalogue.ts'
 import { createVanishTracker } from './model/vanish.ts'
-import type { GitHubSource, Sink, Sources } from './ports.ts'
+import type { GitHubSource, Logger, Sink, Sources } from './ports.ts'
 import { type Deps, sampleOnce } from './run.ts'
 import { NOW, ORG, queueArn, testConfig } from './test/fixtures.ts'
 
@@ -139,6 +138,19 @@ describe('sampleOnce', () => {
     assert.ok(
       notFilled.logs.some(([level, message]) => level === 'warn' && /filled in/.test(message)),
     )
+  })
+
+  it('logs why each queue or scope that failed alone could not be read', async () => {
+    const { deps, logs } = harness({
+      ...healthy(),
+      queueDepths: async () => ({
+        values: new Map([[ARN, { visible: 0, inFlight: 0, delayed: 0 }]]),
+        failed: [{ key: queueArn('ci-dlq'), error: 'AccessDenied' }],
+      }),
+    })
+    await sampleOnce(deps)
+    const logged = logs.find(([, message]) => message === 'queues not read')
+    assert.deepEqual(logged?.[2], { queues: [{ key: queueArn('ci-dlq'), error: 'AccessDenied' }] })
   })
 
   it('reports GitHub as failed when its credentials cannot be read', async () => {

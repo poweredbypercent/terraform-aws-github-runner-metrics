@@ -34,6 +34,6 @@ output "github_app_secret_name" {
 }
 
 output "runner_configs" {
-  description = "The runner configs as the module derived them (environment, cap, queues, GitHub API). Check this first when a series looks wrong."
+  description = "The runner configs as the module derived them (environment, cap, main and dead-letter queue, GitHub API). Check this first when a series looks wrong."
   value       = local.runner_configs
 }

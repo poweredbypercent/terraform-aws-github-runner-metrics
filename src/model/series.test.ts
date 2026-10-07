@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { scopeKey } from '../domain/scope.ts'
 import type { GitHubScope, RegisteredRunner, RunnerInstance, Snapshot } from '../domain/types.ts'
-import { queueArn as ARN, NOW, ORG, testConfig } from '../test/fixtures.ts'
+import { queueArn as ARN, NOW, ORG, queuesOf, testConfig } from '../test/fixtures.ts'
 import { PREFIX, type Sample } from './catalogue.ts'
 import { buildSeries } from './series.ts'
 
@@ -15,7 +15,7 @@ const config = testConfig({
       environment: 'ci-linux',
       max_runners: 64,
       runner_name_prefix: 'linux',
-      queue_arns: [ARN('ci-linux-queued-builds'), ARN('ci-linux-queued-builds_dead_letter')],
+      queues: queuesOf('ci-linux-queued-builds', 'ci-linux-queued-builds_dead_letter'),
       labels: { team: 'platform' },
     },
     {
@@ -23,7 +23,7 @@ const config = testConfig({
       environment: 'ci-gpu',
       max_runners: -1,
       runner_name_prefix: 'gpu',
-      queue_arns: [ARN('ci-gpu-queued-builds')],
+      queues: queuesOf('ci-gpu-queued-builds'),
     },
   ],
   labels: { stack: 'ci' },
@@ -89,7 +89,7 @@ describe('buildSeries', () => {
             [ARN('ci-linux-queued-builds'), { visible: 3, inFlight: 1, delayed: 0 }],
             [ARN('ci-linux-queued-builds_dead_letter'), { visible: 2, inFlight: 0, delayed: 0 }],
           ]),
-          failed: [ARN('ci-gpu-queued-builds')],
+          failed: [{ key: ARN('ci-gpu-queued-builds'), error: 'AccessDenied' }],
         },
         ages: new Map([[ARN('ci-linux-queued-builds'), 140]]),
       }),
@@ -121,6 +121,32 @@ describe('buildSeries', () => {
       value(series, 'scale_up_queue_oldest_message_age_seconds', { ...linux, queue: 'main' }),
       140,
     )
+  })
+
+  it('checks the age against what SQS saw: empty is 0, missing has none, unread keeps it', () => {
+    const age = (labels: Record<string, string>, series: readonly Sample[]) =>
+      find(series, 'scale_up_queue_oldest_message_age_seconds', labels).map(s => s.value)
+    const series = buildSeries(
+      config,
+      snapshot({
+        depths: {
+          // The linux main queue has drained; its dead-letter queue does not exist.
+          values: new Map([
+            [ARN('ci-linux-queued-builds'), { visible: 0, inFlight: 0, delayed: 0 }],
+          ]),
+          failed: [{ key: ARN('ci-gpu-queued-builds'), error: 'AccessDenied' }],
+        },
+        // CloudWatch still has the last datapoint from before the queue drained.
+        ages: new Map([
+          [ARN('ci-linux-queued-builds'), 900],
+          [ARN('ci-linux-queued-builds_dead_letter'), 0],
+          [ARN('ci-gpu-queued-builds'), 45],
+        ]),
+      }),
+    )
+    assert.deepEqual(age({ runner_config: 'linux', queue: 'main' }, series), [0])
+    assert.deepEqual(age({ runner_config: 'linux', queue: 'dead_letter' }, series), [])
+    assert.deepEqual(age({ runner_config: 'gpu' }, series), [45])
   })
 
   it('counts live instances by type, lifecycle and state, and orphans apart', () => {
@@ -179,20 +205,56 @@ describe('buildSeries', () => {
     assert.equal(value(series, 'idle_runners', repo), 1)
   })
 
-  it('counts instances that have not registered, past the grace period', () => {
+  it('cannot place a runner whose instance has gone when its config has no name prefix', () => {
+    const unprefixed = testConfig({
+      runner_configs: [{ name: 'linux', environment: 'ci-linux', queues: queuesOf('q') }],
+    })
+    const series = buildSeries(
+      unprefixed,
+      snapshot({
+        instances: [instance('i-0aaaaaaaa')],
+        runners: {
+          values: new Map([
+            [
+              scopeKey(ORG),
+              [runner('i-0aaaaaaaa'), runner('i-0ffffffff', { status: 'offline', busy: false })],
+            ],
+          ]),
+          failed: [],
+        },
+      }),
+    )
+    // Documented in offline_runners: the gone instance's runner belongs to no known config.
+    assert.equal(value(series, 'offline_runners', { runner_config: 'linux' }), 0)
+    assert.equal(value(series, 'busy_runners', { runner_config: 'linux' }), 1)
+  })
+
+  it('counts instances whose runner is not online yet, past the grace period', () => {
     const series = buildSeries(
       config,
       snapshot({
         instances: [
-          instance('i-0aaaaaaaa'), // registered
-          instance('i-0bbbbbbbb'), // booting
+          instance('i-0aaaaaaaa'), // online
+          instance('i-0bbbbbbbb'), // no runner yet
+          instance('i-0eeeeeeee'), // JIT: registered before boot, offline until it connects
           instance('i-0cccccccc', { launchTime: NOW - 10_000 }), // too young to count
           instance('i-0dddddddd', { orphan: true }), // scale-down's problem
         ],
-        runners: { values: new Map([[scopeKey(ORG), [runner('linuxi-0aaaaaaaa')]]]), failed: [] },
+        runners: {
+          values: new Map([
+            [
+              scopeKey(ORG),
+              [
+                runner('linuxi-0aaaaaaaa'),
+                runner('linuxi-0eeeeeeee', { status: 'offline', busy: false }),
+              ],
+            ],
+          ]),
+          failed: [],
+        },
       }),
     )
-    assert.equal(value(series, 'booting_runners', { runner_config: 'linux' }), 1)
+    assert.equal(value(series, 'booting_runners', { runner_config: 'linux' }), 2)
     assert.equal(value(series, 'booting_runners', { runner_config: 'gpu' }), 0)
     // A scope that was read but has no runners yet still reports zeros.
     assert.equal(value(series, 'idle_runners', { runner_config: 'linux', runner_type: 'org' }), 0)
@@ -203,7 +265,7 @@ describe('buildSeries', () => {
       config,
       snapshot({
         instances: [instance('i-0aaaaaaaa', { scope: REPO })],
-        runners: { values: new Map(), failed: [scopeKey(REPO)] },
+        runners: { values: new Map(), failed: [{ key: scopeKey(REPO), error: '404' }] },
       }),
     )
     assert.equal(find(failedScope, 'booting_runners', { runner_config: 'linux' }).length, 0)

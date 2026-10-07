@@ -1,13 +1,7 @@
 import { invalidLabelName } from '../domain/labels.ts'
 import { err, ok, type Result } from '../domain/result.ts'
-import type { QueueKind, QueueRef } from '../domain/types.ts'
-import type {
-  Config,
-  GitHubCredentials,
-  RemoteWriteAuth,
-  RemoteWriteConfig,
-  RunnerConfig,
-} from './types.ts'
+import type { QueueKind, QueueRef, RunnerConfig } from '../domain/types.ts'
+import type { Config, GitHubCredentials, RemoteWriteAuth, RemoteWriteConfig } from './types.ts'
 
 /**
  * Parses the CONFIG environment variable the Terraform module writes (JSON, snake_case).
@@ -71,13 +65,14 @@ class Reader {
     value: Json,
     at: string,
     check: (key: string) => string | undefined,
+    valuePattern?: RegExp,
   ): Record<string, string> {
     if (value === undefined || value === null) return {}
     const map: Record<string, string> = {}
     for (const [key, item] of Object.entries(this.object(value, at))) {
       const problem = check(key)
       if (problem) this.problems.push(`${at}.${key} ${problem}`)
-      else map[key] = this.string(item, `${at}.${key}`)
+      else map[key] = this.string(item, `${at}.${key}`, valuePattern)
     }
     return map
   }
@@ -102,24 +97,45 @@ const RESERVED_HEADERS = [
 /** SigV4's own headers (x-amz-date, x-amz-security-token, ...) are the signer's to set. */
 const isReservedHeader = (name: string): boolean =>
   RESERVED_HEADERS.includes(name.toLowerCase()) || name.toLowerCase().startsWith('x-amz-')
+/**
+ * Headers are plain configuration, visible in the function's settings: one named like a
+ * credential belongs in the basic or bearer secret instead.
+ */
+const CREDENTIAL_HEADER = /key|token|secret|passw|credential|auth|cookie|session/i
+/** Visible ASCII and spaces: a control character would make every request fail. */
+const HEADER_VALUE = /^[\x20-\x7e]+$/
 /** An organisation, or "owner/repo", as GitHub names them. */
 const OWNER = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\/[A-Za-z0-9._-]{1,100})?$/
+const QUEUE_KINDS: readonly QueueKind[] = ['main', 'dead_letter']
 
-/** SQS endpoints by partition; the URL is derived from the ARN so the config stays small. */
-const DNS_SUFFIX: Record<string, string> = {
-  aws: 'amazonaws.com',
-  'aws-us-gov': 'amazonaws.com',
-  'aws-cn': 'amazonaws.com.cn',
-}
-
-export function queueFromArn(arn: string): Result<QueueRef> {
+/** A queue the Terraform module named, with its kind; the ARN gives the name CloudWatch uses. */
+export function queueFromArn(arn: string, kind: QueueKind): Result<QueueRef> {
   const match = arn.match(ARN_SQS)
   if (!match) return err(`${arn} is not an SQS queue ARN`)
-  const [, partition = '', region = '', account = '', name = ''] = match
-  const suffix = DNS_SUFFIX[partition]
-  if (!suffix) return err(`${arn} is in partition ${partition}, which is not supported`)
-  const kind: QueueKind = /_dead_letter(\.fifo)?$/.test(name) ? 'dead_letter' : 'main'
-  return ok({ arn, name, url: `https://sqs.${region}.${suffix}/${account}/${name}`, kind })
+  return ok({ arn, name: match[4] ?? '', kind })
+}
+
+function queues(r: Reader, value: Json, at: string): QueueRef[] {
+  const refs: QueueRef[] = []
+  for (const [i, item] of r.array(value, at).entries()) {
+    const o = r.object(item, `${at}[${i}]`)
+    const kind = QUEUE_KINDS.find(k => k === o.kind)
+    if (!kind) {
+      r.problems.push(`${at}[${i}].kind must be one of ${QUEUE_KINDS.join(', ')}`)
+      continue
+    }
+    const queue = queueFromArn(r.string(o.arn, `${at}[${i}].arn`), kind)
+    if (queue.ok) refs.push(queue.value)
+    else r.problems.push(`${at}[${i}]: ${queue.error}`)
+  }
+  // Two queues of one kind would be two series with the same labels in one push: a 400 every time.
+  if (refs.filter(q => q.kind === 'main').length !== 1) {
+    r.problems.push(`${at} must have exactly one main queue`)
+  }
+  if (refs.filter(q => q.kind === 'dead_letter').length > 1) {
+    r.problems.push(`${at} may have at most one dead_letter queue`)
+  }
+  return refs
 }
 
 /**
@@ -148,13 +164,9 @@ function endpointUrl(r: Reader, value: Json, at: string, requireHttps: boolean):
 
 function runnerConfig(r: Reader, value: Json, at: string): RunnerConfig {
   const o = r.object(value, at)
-  const queues: QueueRef[] = []
-  for (const [i, arn] of r.array(o.queue_arns, `${at}.queue_arns`).entries()) {
-    const queue = queueFromArn(r.string(arn, `${at}.queue_arns[${i}]`))
-    if (queue.ok) queues.push(queue.value)
-    else r.problems.push(`${at}.queue_arns[${i}]: ${queue.error}`)
-  }
   const max = o.max_runners
+  const prefix = o.runner_name_prefix ?? ''
+  if (typeof prefix !== 'string') r.problems.push(`${at}.runner_name_prefix must be a string`)
   return {
     name: r.string(o.name, `${at}.name`, /^[A-Za-z0-9_.-]+$/),
     environment: r.string(o.environment, `${at}.environment`, /^[A-Za-z0-9_-]+$/),
@@ -162,7 +174,7 @@ function runnerConfig(r: Reader, value: Json, at: string): RunnerConfig {
       max === null || max === undefined || max === -1
         ? null
         : r.number(max, `${at}.max_runners`, 0, 100_000),
-    runnerNamePrefix: typeof o.runner_name_prefix === 'string' ? o.runner_name_prefix : '',
+    runnerNamePrefix: typeof prefix === 'string' ? prefix : '',
     // Always https: the App's installation tokens are sent there.
     githubApiUrl: endpointUrl(
       r,
@@ -170,7 +182,7 @@ function runnerConfig(r: Reader, value: Json, at: string): RunnerConfig {
       `${at}.github_api_url`,
       true,
     ),
-    queues,
+    queues: queues(r, o.queues, `${at}.queues`),
     labels: r.stringMap(o.labels, `${at}.labels`, invalidLabelName),
   }
 }
@@ -232,12 +244,18 @@ function remoteWrite(r: Reader, value: Json, at: string): RemoteWriteConfig {
   return {
     url: endpointUrl(r, o.url, `${at}.url`, auth.type !== 'none'),
     auth,
-    headers: r.stringMap(o.headers, `${at}.headers`, name =>
-      !HEADER_NAME.test(name)
-        ? 'is not a valid header name'
-        : isReservedHeader(name)
-          ? 'is set by the remote-write client and cannot be overridden'
-          : undefined,
+    headers: r.stringMap(
+      o.headers,
+      `${at}.headers`,
+      name =>
+        !HEADER_NAME.test(name)
+          ? 'is not a valid header name'
+          : isReservedHeader(name)
+            ? 'is set by the remote-write client and cannot be overridden'
+            : CREDENTIAL_HEADER.test(name)
+              ? 'looks like a credential: use remote_write basic or bearer auth, which keeps it in a secret'
+              : undefined,
+      HEADER_VALUE,
     ),
     timeoutMs: r.number(o.timeout_seconds ?? 10, `${at}.timeout_seconds`, 1, 60) * 1000,
   }

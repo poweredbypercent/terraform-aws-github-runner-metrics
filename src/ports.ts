@@ -37,3 +37,15 @@ export interface GitHubSource {
 export interface Sink {
   push(samples: readonly Sample[]): Promise<void>
 }
+
+/**
+ * Sources and the sink reject when they fail; run.ts settles each source on its own, and a sink
+ * failure fails the invocation.
+ */
+
+/** One structured event; the handler logs them as JSON lines. */
+export type Logger = (
+  level: 'info' | 'warn' | 'error',
+  message: string,
+  fields?: Readonly<Record<string, unknown>>,
+) => void

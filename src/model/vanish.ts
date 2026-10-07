@@ -29,7 +29,13 @@ interface Remembered {
   readonly remaining: number
 }
 
-export function createVanishTracker(samplesToZero = 5): VanishTracker {
+/**
+ * Zeros are sent for this many samples: at the recommended one-minute rate, Prometheus' five-minute
+ * lookback, after which a series that stopped would have gone stale anyway.
+ */
+const ZERO_SAMPLES = 5
+
+export function createVanishTracker(samplesToZero = ZERO_SAMPLES): VanishTracker {
   let remembered: ReadonlyMap<string, Remembered> = new Map()
   return {
     apply(samples, up, now) {

@@ -1,16 +1,3 @@
-# The GitHub App's credentials, created empty: the private key never passes through Terraform or
-# its state. Fill it once the App exists (see the README):
-#   aws secretsmanager put-secret-value --secret-id <name> --secret-string file://github-app.json
-# The Lambda reads it at the next sample; until then it samples everything but GitHub.
-resource "aws_secretsmanager_secret" "github_app" {
-  count                   = var.github_app.source == "create_secret" ? 1 : 0
-  name                    = "${var.name_prefix}/github-app"
-  description             = "GitHub App for ${var.name_prefix}: JSON {\"app_id\": \"...\", \"private_key\": \"<PEM>\"}. Read-only App: organisation Self-hosted runners, repository Administration."
-  kms_key_id              = var.kms_key_arn
-  recovery_window_in_days = var.github_app.recovery_window_in_days
-  tags                    = var.tags
-}
-
 resource "aws_cloudwatch_log_group" "lambda" {
   name              = "/aws/lambda/${var.name_prefix}"
   retention_in_days = var.log_retention_in_days
@@ -68,6 +55,53 @@ resource "aws_lambda_function" "this" {
   tags = var.tags
 
   depends_on = [aws_cloudwatch_log_group.lambda, aws_iam_role_policy.lambda]
+
+  # Configuration the Lambda would reject on every invocation (config.tf). A value read from a
+  # runner stack may be unknown until it is applied; the check then waits for the apply.
+  lifecycle {
+    precondition {
+      condition     = length(local.runner_configs) > 0
+      error_message = "No runner configs: set runner_stacks (from the runner module's outputs) or runner_configs."
+    }
+    precondition {
+      condition     = length(local.duplicate_runner_config_names) == 0
+      error_message = "Runner config names appear more than once (in two runner_stacks, or in runner_stacks and runner_configs); every runner_config label must be unique: ${join(", ", local.duplicate_runner_config_names)}."
+    }
+    precondition {
+      condition     = length(local.invalid_runner_config_names) == 0
+      error_message = "Runner config names (multi-runner keys, runner_stacks[].name, runner_configs keys) may contain only letters, digits, '.', '-' and '_': ${join(", ", local.invalid_runner_config_names)}."
+    }
+    precondition {
+      condition     = length(local.runner_configs_without_environment) == 0
+      error_message = "Runner configs without a usable ENVIRONMENT (letters, digits, '-' and '_') in their scale-up Lambda: ${join(", ", local.runner_configs_without_environment)}. Pass the runner module's outputs unchanged, or describe the stack in runner_configs."
+    }
+    precondition {
+      condition     = length(local.duplicate_environments) == 0
+      error_message = "Environments sampled by more than one runner config (a stack given in both runner_stacks and runner_configs?): ${join(", ", local.duplicate_environments)}."
+    }
+    precondition {
+      condition     = length(local.insecure_github_api_urls) == 0
+      error_message = "Runner configs whose GitHub URL is not https (the App's tokens are sent there): ${join(", ", local.insecure_github_api_urls)}. Set github_enterprise_server_url, or the runner config's github_api_url."
+    }
+    precondition {
+      condition     = length(local.runner_configs_out_of_range) == 0
+      error_message = "Runner configs whose runner cap is not -1 or 0-100000: ${join(", ", local.runner_configs_out_of_range)}."
+    }
+    precondition {
+      condition     = length(local.invalid_labels) == 0
+      error_message = "Constant labels (labels, runner_stacks[].labels, runner_configs[].labels) must be Prometheus label names, not start with \"__\", not reuse a built-in label, and have a value: ${join(", ", local.invalid_labels)}."
+    }
+    precondition {
+      # A conditional, not ||: Terraform before 1.12 evaluates both sides of ||, and values(null) fails.
+      condition     = local.github_ssm_parameters == null ? true : length(compact(values(local.github_ssm_parameters))) == 2
+      error_message = "github_app.source = \"runner_ssm\" but the runner module's GitHub App parameter names were not found; set github_app.ssm."
+    }
+    precondition {
+      # GitHub waits for EC2, so two source budgets run back to back, then the push.
+      condition     = var.lambda_timeout >= 2 * var.source_timeout_seconds + var.remote_write.timeout_seconds + 5
+      error_message = "lambda_timeout is too short to finish a slow sample: it needs 2 x source_timeout_seconds + remote_write.timeout_seconds + 5 seconds."
+    }
+  }
 }
 
 # A failed sample is not retried: a retry would push that minute's samples after the next

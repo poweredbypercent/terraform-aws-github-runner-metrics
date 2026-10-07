@@ -22,17 +22,27 @@ describe('catalogue', () => {
     )
   })
 
-  it('reserves exactly the labels the metrics set, here and in the Terraform validation', () => {
+  it('reserves exactly the labels the metrics set, here and in the Terraform module', () => {
     const used = [...new Set(ALL_METRICS.flatMap(m => m.labels))].sort()
     assert.deepEqual([...BUILT_IN_LABELS].sort(), used)
-    const variables = readFileSync(new URL('../../variables.tf', import.meta.url), 'utf8')
-    const reserved = variables.match(/!contains\((\[[^\]]*"runner_config"[^\]]*\]), k\)/)?.[1]
-    assert.ok(reserved, 'variables.tf: labels validation not found')
+    const config = readFileSync(new URL('../../config.tf', import.meta.url), 'utf8')
+    const reserved = config.match(/built_in_labels = (\[[^\]]*\])/)?.[1]
+    assert.ok(reserved, 'config.tf: local.built_in_labels not found')
     assert.deepEqual((JSON.parse(reserved) as string[]).sort(), used)
   })
 
   it('keeps docs/metrics.md in step with the catalogue', () => {
     const docs = readFileSync(new URL('../../docs/metrics.md', import.meta.url), 'utf8')
     assert.equal(docs, renderMetricDocs(), 'run npm run docs:metrics and commit the result')
+  })
+
+  it('names only metrics that exist, in the hand-written docs and queries', () => {
+    const known = new Set(ALL_METRICS.map(m => m.name))
+    for (const file of ['README.md', 'docs/alternatives.md', 'CONTRIBUTING.md']) {
+      const text = readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8')
+      for (const [name] of text.matchAll(new RegExp(`${PREFIX}[a-z_]+`, 'g'))) {
+        assert.ok(known.has(name), `${file} names ${name}, which the catalogue does not define`)
+      }
+    }
   })
 })

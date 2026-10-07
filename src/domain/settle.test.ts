@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { abortsAfter } from '../test/fixtures.ts'
 import { describeError } from './result.ts'
-import { readEach, settle } from './settle.ts'
+import { readEach, settle, untilAborted } from './settle.ts'
 
 describe('settle', () => {
   it('returns the value of a source that finishes in time', async () => {
@@ -32,6 +33,15 @@ describe('settle', () => {
   })
 })
 
+describe('untilAborted', () => {
+  it('passes a result through, and stops waiting when the signal fires', async () => {
+    assert.equal(await untilAborted(Promise.resolve(1), new AbortController().signal), 1)
+    await assert.rejects(untilAborted(new Promise(() => {}), abortsAfter(10)), /aborted after 10ms/)
+    const aborted = AbortSignal.abort(new Error('gone'))
+    await assert.rejects(untilAborted(Promise.resolve(1), aborted), /gone/)
+  })
+})
+
 describe('readEach', () => {
   const read = async (item: string) => {
     if (item === 'broken') throw new Error('AccessDenied')
@@ -39,20 +49,20 @@ describe('readEach', () => {
     return item.length
   }
 
-  it('keeps what could be read, lists what failed, and skips what does not exist', async () => {
+  it('keeps what could be read, what failed and why, and skips what does not exist', async () => {
     const result = await readEach(['abc', 'broken', 'absent'], item => item, read)
     assert.deepEqual([...result.values], [['abc', 3]])
-    assert.deepEqual(result.failed, ['broken'])
+    assert.deepEqual(result.failed, [{ key: 'broken', error: 'AccessDenied' }])
   })
 
-  it('fails as a whole when nothing could be read', async () => {
+  it('fails as a whole when nothing could be read, naming the distinct reasons', async () => {
     await assert.rejects(
       readEach(
-        ['a', 'b'],
+        ['a', 'b', 'c'],
         item => item,
-        () => Promise.reject(new Error('x')),
+        item => Promise.reject(new Error(item === 'c' ? 'Throttling' : 'AccessDenied')),
       ),
-      /none of 2 could be read/,
+      /none of 3 could be read: AccessDenied; Throttling/,
     )
   })
 

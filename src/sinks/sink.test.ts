@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { untilAborted } from '../domain/settle.ts'
 import type { Fetch } from '../http.ts'
 import { type Auth, noAuth } from './auth.ts'
 import { remoteWriteSink } from './remote-write/sink.ts'
@@ -59,6 +60,17 @@ describe('post', () => {
     }
   })
 
+  it('neither follows nor retries a redirect: it would carry the credentials elsewhere', async () => {
+    const calls: RequestInit[] = []
+    const fetchImpl: Fetch = async (_, init) => {
+      calls.push(init ?? {})
+      return new Response(null, { status: 307, headers: { location: 'https://elsewhere/' } })
+    }
+    await assert.rejects(post(fetchImpl, request, 1), /307 redirect not followed/)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]?.redirect, 'manual')
+  })
+
   it('does not retry a 429 either: the next sample is the retry', async () => {
     const { calls, fetchImpl } = respond(429)
     await assert.rejects(post(fetchImpl, request, 1), /429/)
@@ -102,6 +114,22 @@ describe('remoteWriteSink', () => {
     const { calls, fetchImpl } = respond()
     await sink(fetchImpl).push([])
     assert.equal(calls.length, 0)
+  })
+
+  it('gives up on credentials that do not arrive within the push budget', async () => {
+    const hanging: Auth = { ...noAuth, sign: () => new Promise(() => {}) }
+    const stalled = remoteWriteSink({
+      url: 'http://receiver/api/v1/write',
+      auth: {
+        ...hanging,
+        sign: (request, signal) => untilAborted(hanging.sign(request, signal), signal),
+      },
+      headers: {},
+      timeoutMs: 20,
+      userAgent: 'test',
+      fetch: respond().fetchImpl,
+    })
+    await assert.rejects(stalled.push(SAMPLE), /no credentials within 20ms/)
   })
 
   it('tells the auth when the receiver refuses its credentials, and only then', async () => {

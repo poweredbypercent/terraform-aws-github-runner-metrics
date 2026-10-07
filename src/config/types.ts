@@ -1,20 +1,4 @@
-import type { QueueRef } from '../domain/types.ts'
-
-/** One runner config of a runner stack: what the module calls a "runner" in multi_runner_config. */
-export interface RunnerConfig {
-  /** The `runner_config` label: the multi-runner key, or the stack's name. */
-  readonly name: string
-  /** The `environment` label and the ghr:environment tag value: `<prefix>` or `<prefix>-<key>`. */
-  readonly environment: string
-  /** runners_maximum_count; null when unlimited, and then no capacity series is reported. */
-  readonly maxRunners: number | null
-  readonly runnerNamePrefix: string
-  /** GitHub REST API base for this stack (GitHub Enterprise Server sets its own). */
-  readonly githubApiUrl: string
-  readonly queues: readonly QueueRef[]
-  /** Constant labels for this runner config's series only. */
-  readonly labels: Readonly<Record<string, string>>
-}
+import type { RunnerConfig } from '../domain/types.ts'
 
 export type GitHubCredentials =
   | { readonly type: 'none' }

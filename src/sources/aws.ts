@@ -1,8 +1,13 @@
 import type { Instance } from '@aws-sdk/client-ec2'
-import type { RunnerConfig } from '../config/types.ts'
 import { scopeFromTags } from '../domain/scope.ts'
 import { readEach } from '../domain/settle.ts'
-import type { PartialResult, QueueDepth, QueueRef, RunnerInstance } from '../domain/types.ts'
+import type {
+  PartialResult,
+  QueueDepth,
+  QueueRef,
+  RunnerConfig,
+  RunnerInstance,
+} from '../domain/types.ts'
 
 /**
  * The AWS sources. Each takes a small function ("port") for the one API call it needs; the handler
@@ -10,10 +15,11 @@ import type { PartialResult, QueueDepth, QueueRef, RunnerInstance } from '../dom
  * the call: which queues, how results map onto the domain, what a missing datapoint means.
  */
 
+/** A queue's attributes, or undefined when the queue does not exist. */
 export type GetQueueAttributes = (
-  queueUrl: string,
+  queueArn: string,
   signal: AbortSignal,
-) => Promise<Readonly<Record<string, string | undefined>>>
+) => Promise<Readonly<Record<string, string | undefined>> | undefined>
 
 /** Oldest-message age datapoints per queue name, newest first. */
 export type GetQueueAgeDatapoints = (
@@ -42,32 +48,40 @@ export async function readQueueDepths(
     allQueues(configs),
     queue => queue.arn,
     async queue => {
-      try {
-        const a = await getAttributes(queue.url, signal)
-        return {
-          visible: Number(a.ApproximateNumberOfMessages ?? 0),
-          inFlight: Number(a.ApproximateNumberOfMessagesNotVisible ?? 0),
-          delayed: Number(a.ApproximateNumberOfMessagesDelayed ?? 0),
-        }
-      } catch (error) {
+      const attributes = await getAttributes(queue.arn, signal)
+      if (attributes === undefined) {
         // A runner config without redrive_build_queue has no dead-letter queue. Its ARN is still
         // derived from the naming convention (multi-runner stacks do not output their queues),
-        // so a missing one is absent, not a failure.
-        if (queue.kind === 'dead_letter' && isNonExistentQueue(error)) return undefined
-        throw error
+        // so a missing one is absent, not a failure. A missing main queue is a misconfiguration.
+        if (queue.kind === 'dead_letter') return undefined
+        throw new Error(`queue ${queue.name} does not exist`)
+      }
+      return {
+        visible: count(attributes, 'ApproximateNumberOfMessages'),
+        inFlight: count(attributes, 'ApproximateNumberOfMessagesNotVisible'),
+        delayed: count(attributes, 'ApproximateNumberOfMessagesDelayed'),
       }
     },
   )
 }
 
-const isNonExistentQueue = (error: unknown): boolean =>
-  error instanceof Error &&
-  /NonExistentQueue|QueueDoesNotExist/.test(`${error.name} ${error.message}`)
+/** An attribute SQS was asked for; one it did not return is a failure, not a zero. */
+function count(attributes: Readonly<Record<string, string | undefined>>, name: string): number {
+  const value = Number(attributes[name])
+  if (attributes[name] === undefined || !Number.isFinite(value)) {
+    throw new Error(`SQS returned no ${name}`)
+  }
+  return value
+}
+
+/** How far back to look for the newest datapoint: SQS publishes each minute, a minute behind. */
+const AGE_LOOKBACK_MS = 5 * 60_000
 
 /**
  * The oldest message's age per queue, from CloudWatch: SQS publishes it each minute, about a
  * minute behind. No datapoint means the queue has been idle (SQS stops publishing for idle
- * queues), which is an age of zero.
+ * queues), which is an age of zero. A queue SQS says is empty is zero whatever CloudWatch's last
+ * datapoint says; the model applies that, since it needs both sources.
  */
 export async function readQueueAges(
   getDatapoints: GetQueueAgeDatapoints,
@@ -78,7 +92,7 @@ export async function readQueueAges(
   const queues = allQueues(configs)
   const datapoints = await getDatapoints(
     queues.map(q => q.name),
-    { start: new Date(now - 5 * 60_000), end: new Date(now) },
+    { start: new Date(now - AGE_LOOKBACK_MS), end: new Date(now) },
     signal,
   )
   return new Map(queues.map(q => [q.arn, datapoints.get(q.name)?.[0] ?? 0]))

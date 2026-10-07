@@ -2,11 +2,10 @@ import type { Config } from './config/types.ts'
 import { err, type Result } from './domain/result.ts'
 import { settle } from './domain/settle.ts'
 import type { RunnerInstance, Snapshot, SourceHealth, SourceName } from './domain/types.ts'
-import type { Logger } from './log.ts'
 import { METRICS, type Sample, sample } from './model/catalogue.ts'
 import { buildSeries } from './model/series.ts'
 import type { VanishTracker } from './model/vanish.ts'
-import type { GitHubSource, RegisteredRunners, Sink, Sources } from './ports.ts'
+import type { GitHubSource, Logger, RegisteredRunners, Sink, Sources } from './ports.ts'
 
 /**
  * One sample of the runner stack: read every source, build the series, push them.
@@ -35,7 +34,7 @@ export async function sampleOnce(deps: Deps): Promise<Outcome> {
   const now = deps.now()
   const { snapshot, up } = await readSources(deps, now)
   const proposed = deps.vanish.apply(buildSeries(deps.config, snapshot), up, now)
-  const series = finalise(deps.config, proposed.samples, up, now, deps.now())
+  const series = finalise(deps.config.labels, proposed.samples, up, now, deps.now())
   await deps.sink.push(series)
   proposed.commit()
   deps.log('info', 'pushed', { series: series.length, up })
@@ -72,6 +71,7 @@ async function readSources(
   ] as const) {
     if (result && !result.ok) log('warn', 'source failed', { source, error: result.error })
   }
+  // Each with its reason: a missing permission, an App not installed, a timeout.
   if (depths.ok && depths.value.failed.length > 0) {
     log('warn', 'queues not read', { queues: depths.value.failed })
   }
@@ -114,7 +114,7 @@ async function readGitHub(
 
 /** The sampler's own series, and the global constant labels on every series. */
 function finalise(
-  config: Config,
+  labels: Config['labels'],
   samples: readonly Sample[],
   up: SourceHealth,
   now: number,
@@ -128,5 +128,5 @@ function finalise(
     sample(METRICS.sampleDuration, {}, (finished - now) / 1000, now),
     sample(METRICS.lastSampleTimestamp, {}, now / 1000, now),
   ]
-  return series.map(s => ({ ...s, labels: { ...config.labels, ...s.labels } }))
+  return series.map(s => ({ ...s, labels: { ...labels, ...s.labels } }))
 }

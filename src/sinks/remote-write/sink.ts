@@ -20,20 +20,31 @@ export function remoteWriteSink(options: {
       const started = Date.now()
       const body = snappyLiterals(encodeWriteRequest(samples))
       // Reading a secret or credentials comes out of the same budget as the post itself.
-      const headers = await options.auth.sign(
-        {
-          url: options.url,
-          body,
-          headers: {
-            ...options.headers,
-            'content-encoding': 'snappy',
-            'content-type': 'application/x-protobuf',
-            'user-agent': options.userAgent,
-            'x-prometheus-remote-write-version': '0.1.0',
-          },
-        },
-        AbortSignal.timeout(options.timeoutMs),
+      const deadline = new AbortController()
+      const timer = setTimeout(
+        () =>
+          deadline.abort(new Error(`remote_write: no credentials within ${options.timeoutMs}ms`)),
+        options.timeoutMs,
       )
+      let headers: Record<string, string>
+      try {
+        headers = await options.auth.sign(
+          {
+            url: options.url,
+            body,
+            headers: {
+              ...options.headers,
+              'content-encoding': 'snappy',
+              'content-type': 'application/x-protobuf',
+              'user-agent': options.userAgent,
+              'x-prometheus-remote-write-version': '0.1.0',
+            },
+          },
+          deadline.signal,
+        )
+      } finally {
+        clearTimeout(timer)
+      }
       const timeoutMs = Math.max(options.timeoutMs - (Date.now() - started), 1)
       try {
         await post(options.fetch, { url: options.url, headers, body, timeoutMs })

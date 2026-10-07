@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
+import { queuesOf } from '../test/fixtures.ts'
 import { ConfigError, parseConfig, queueFromArn } from './parse.ts'
 
 const minimal = {
@@ -10,14 +11,16 @@ const minimal = {
       environment: 'ci-linux',
       max_runners: 64,
       runner_name_prefix: 'linux',
-      queue_arns: [
-        'arn:aws:sqs:eu-west-1:123456789012:ci-linux-queued-builds',
-        'arn:aws:sqs:eu-west-1:123456789012:ci-linux-queued-builds_dead_letter',
-      ],
+      queues: queuesOf('ci-linux-queued-builds', 'ci-linux-queued-builds_dead_letter'),
     },
   ],
   remote_write: { url: 'http://localhost:9090/api/v1/write' },
 }
+
+const withRunnerConfig = (overrides: Record<string, unknown>) => ({
+  ...minimal,
+  runner_configs: [{ ...minimal.runner_configs[0], ...overrides }],
+})
 
 const problemsOf = (config: unknown): readonly string[] => {
   try {
@@ -29,6 +32,16 @@ const problemsOf = (config: unknown): readonly string[] => {
   assert.fail('expected a ConfigError')
 }
 
+const assertProblems = (config: unknown, expected: readonly RegExp[]) => {
+  const problems = problemsOf(config)
+  for (const pattern of expected) {
+    assert.ok(
+      problems.some(p => pattern.test(p)),
+      `expected a problem matching ${pattern}, got:\n${problems.join('\n')}`,
+    )
+  }
+}
+
 describe('parseConfig', () => {
   it('reads a minimal config with defaults', () => {
     const config = parseConfig(JSON.stringify(minimal))
@@ -37,13 +50,10 @@ describe('parseConfig', () => {
     assert.equal(linux?.maxRunners, 64)
     assert.equal(linux?.githubApiUrl, 'https://api.github.com')
     assert.deepEqual(
-      linux?.queues.map(q => [q.kind, q.url]),
+      linux?.queues.map(q => [q.kind, q.name]),
       [
-        ['main', 'https://sqs.eu-west-1.amazonaws.com/123456789012/ci-linux-queued-builds'],
-        [
-          'dead_letter',
-          'https://sqs.eu-west-1.amazonaws.com/123456789012/ci-linux-queued-builds_dead_letter',
-        ],
+        ['main', 'ci-linux-queued-builds'],
+        ['dead_letter', 'ci-linux-queued-builds_dead_letter'],
       ],
     )
     assert.deepEqual(config.github, { credentials: { type: 'none' }, owners: [] })
@@ -54,14 +64,35 @@ describe('parseConfig', () => {
 
   it('treats -1 and null as an unlimited runner cap', () => {
     for (const max_runners of [-1, null]) {
-      const config = parseConfig(
-        JSON.stringify({
-          ...minimal,
-          runner_configs: [{ ...minimal.runner_configs[0], max_runners }],
-        }),
-      )
+      const config = parseConfig(JSON.stringify(withRunnerConfig({ max_runners })))
       assert.equal(config.runnerConfigs[0]?.maxRunners, null)
     }
+  })
+
+  it('takes each queue kind from the config, whatever the queue is called', () => {
+    const config = parseConfig(
+      JSON.stringify(withRunnerConfig({ queues: queuesOf('jobs.fifo', 'jobs-failed.fifo') })),
+    )
+    assert.deepEqual(
+      config.runnerConfigs[0]?.queues.map(q => [q.kind, q.name]),
+      [
+        ['main', 'jobs.fifo'],
+        ['dead_letter', 'jobs-failed.fifo'],
+      ],
+    )
+  })
+
+  it('requires one main queue and at most one dead-letter queue, of known kinds', () => {
+    assertProblems(withRunnerConfig({ queues: [] }), [/queues must have exactly one main queue/])
+    assertProblems(
+      withRunnerConfig({
+        queues: [...queuesOf('a', 'b'), ...queuesOf('c', 'd')],
+      }),
+      [/exactly one main queue/, /at most one dead_letter queue/],
+    )
+    assertProblems(withRunnerConfig({ queues: [{ arn: queuesOf('a')[0]?.arn, kind: 'retry' }] }), [
+      /queues\[0\]\.kind must be one of main, dead_letter/,
+    ])
   })
 
   it('reads the GitHub and SigV4 options', () => {
@@ -102,86 +133,96 @@ describe('parseConfig', () => {
   })
 
   it('reports every problem at once', () => {
-    const problems = problemsOf({
-      version: 2,
-      runner_configs: [
-        { name: 'a', environment: 'dup', queue_arns: ['not-an-arn'], labels: { state: 'x' } },
-        { name: 'b', environment: 'dup', queue_arns: [] },
-      ],
-      remote_write: {
-        url: 'ftp://nope',
-        auth: { type: 'sigv4', region: 'eu-west-1', external_id: 'x' },
-        headers: { Authorization: 'Bearer secret' },
+    assertProblems(
+      {
+        version: 2,
+        runner_configs: [
+          {
+            name: 'a',
+            environment: 'dup',
+            queues: [{ arn: 'not-an-arn', kind: 'main' }],
+            labels: { state: 'x', team: '' },
+            runner_name_prefix: 7,
+          },
+          { name: 'b', environment: 'dup', queues: queuesOf('b') },
+        ],
+        remote_write: {
+          url: 'ftp://nope',
+          auth: { type: 'sigv4', region: 'eu-west-1', external_id: 'x' },
+          headers: { Authorization: 'Bearer secret' },
+        },
+        labels: { __hidden: 'x', 'bad-name': 'y' },
       },
-      labels: { __hidden: 'x', 'bad-name': 'y' },
-    })
-    for (const expected of [
-      /version must be 1/,
-      /queue_arns\[0\]: not-an-arn is not an SQS queue ARN/,
-      /labels\.state is a built-in label/,
-      /environment "dup" appears more than once/,
-      /remote_write\.url/,
-      /external_id needs role_arn/,
-      /Authorization is set by the remote-write client/,
-      /labels\.__hidden starts with "__"/,
-      /labels\.bad-name is not a valid Prometheus label name/,
-    ]) {
-      assert.ok(
-        problems.some(p => expected.test(p)),
-        `expected a problem matching ${expected}, got:\n${problems.join('\n')}`,
-      )
-    }
+      [
+        /version must be 1/,
+        /queues\[0\]: not-an-arn is not an SQS queue ARN/,
+        /labels\.state is a built-in label/,
+        /labels\.team must be a non-empty string/,
+        /runner_name_prefix must be a string/,
+        /environment "dup" appears more than once/,
+        /remote_write\.url/,
+        /external_id needs role_arn/,
+        /Authorization is set by the remote-write client/,
+        /labels\.__hidden starts with "__"/,
+        /labels\.bad-name is not a valid Prometheus label name/,
+      ],
+    )
   })
 
   it('keeps credentials off plain http and out of URLs', () => {
     const secretArn = 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:remote-write-AbCdEf'
-    const problems = problemsOf({
-      ...minimal,
-      runner_configs: [
-        { ...minimal.runner_configs[0], github_api_url: 'http://ghe.example/api/v3' },
-      ],
-      remote_write: {
-        url: 'http://u:p@prom.example/write?x=1',
-        auth: { type: 'bearer', secret_arn: secretArn },
+    assertProblems(
+      {
+        ...withRunnerConfig({ github_api_url: 'http://ghe.example/api/v3' }),
+        remote_write: {
+          url: 'http://u:p@prom.example/write?x=1',
+          auth: { type: 'bearer', secret_arn: secretArn },
+        },
       },
-    })
-    for (const expected of [
-      /github_api_url must use https/,
-      /remote_write\.url must use https/,
-      /remote_write\.url must not contain credentials/,
-      /remote_write\.url must not contain a query string/,
-    ]) {
-      assert.ok(
-        problems.some(p => expected.test(p)),
-        `${expected}:\n${problems.join('\n')}`,
+      [
+        /github_api_url must use https/,
+        /remote_write\.url must use https/,
+        /remote_write\.url must not contain credentials/,
+        /remote_write\.url must not contain a query string/,
+      ],
+    )
+  })
+
+  it('keeps credentials out of plain headers, and control characters out of their values', () => {
+    for (const name of ['X-Api-Key', 'X-Auth-Token', 'Api-Secret']) {
+      assertProblems(
+        { ...minimal, remote_write: { url: minimal.remote_write.url, headers: { [name]: 'v' } } },
+        [new RegExp(`${name} looks like a credential`)],
       )
     }
+    assertProblems(
+      {
+        ...minimal,
+        remote_write: { url: minimal.remote_write.url, headers: { 'X-Scope-OrgID': 'a\r\nb' } },
+      },
+      [/headers\.X-Scope-OrgID must be a non-empty string matching/],
+    )
   })
 
   it('refuses a wildcard secret ARN', () => {
-    const problems = problemsOf({
-      ...minimal,
-      github: {
-        credentials: {
-          type: 'secret',
-          secret_arn: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:*',
+    assertProblems(
+      {
+        ...minimal,
+        github: {
+          credentials: {
+            type: 'secret',
+            secret_arn: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:*',
+          },
         },
       },
-    })
-    assert.ok(
-      problems.some(p => /github\.credentials\.secret_arn/.test(p)),
-      problems.join('\n'),
+      [/github\.credentials\.secret_arn/],
     )
   })
 
   it('requires an owners allowlist with GitHub credentials, and lower-cases it', () => {
     const secretArn = 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-app-AbCdEf'
     const credentials = { type: 'secret', secret_arn: secretArn }
-    const problems = problemsOf({ ...minimal, github: { credentials } })
-    assert.ok(
-      problems.some(p => /github\.owners must list/.test(p)),
-      problems.join('\n'),
-    )
+    assertProblems({ ...minimal, github: { credentials } }, [/github\.owners must list/])
     const config = parseConfig(
       JSON.stringify({ ...minimal, github: { credentials, owners: ['Acme', 'Acme/Widgets'] } }),
     )
@@ -189,13 +230,12 @@ describe('parseConfig', () => {
   })
 
   it("keeps the signer's own headers for the signer", () => {
-    const problems = problemsOf({
-      ...minimal,
-      remote_write: { url: minimal.remote_write.url, headers: { 'X-Amz-Security-Token': 'x' } },
-    })
-    assert.ok(
-      problems.some(p => /X-Amz-Security-Token is set by/.test(p)),
-      problems.join('\n'),
+    assertProblems(
+      {
+        ...minimal,
+        remote_write: { url: minimal.remote_write.url, headers: { 'X-Amz-Security-Token': 'x' } },
+      },
+      [/X-Amz-Security-Token is set by/],
     )
   })
 
@@ -206,33 +246,25 @@ describe('parseConfig', () => {
 })
 
 describe('queueFromArn', () => {
-  it('derives the queue URL for other partitions', () => {
-    const queue = queueFromArn('arn:aws-cn:sqs:cn-north-1:123456789012:ci-queued-builds')
-    assert.ok(queue.ok)
-    assert.equal(
-      queue.value.url,
-      'https://sqs.cn-north-1.amazonaws.com.cn/123456789012/ci-queued-builds',
-    )
-  })
+  const arn = (name: string) => `arn:aws:sqs:eu-west-1:123456789012:${name}`
 
-  it('reads FIFO queues and their dead-letter queues', () => {
-    const main = queueFromArn('arn:aws:sqs:eu-west-1:123456789012:ci-queued-builds.fifo')
-    const dlq = queueFromArn('arn:aws:sqs:eu-west-1:123456789012:ci-queued-builds_dead_letter.fifo')
-    assert.ok(main.ok && dlq.ok)
-    assert.deepEqual([main.value.kind, dlq.value.kind], ['main', 'dead_letter'])
+  it('takes the queue name from the ARN, in any partition', () => {
+    const queue = queueFromArn('arn:aws-cn:sqs:cn-north-1:123456789012:ci-queued-builds', 'main')
+    assert.deepEqual(queue, {
+      ok: true,
+      value: {
+        arn: 'arn:aws-cn:sqs:cn-north-1:123456789012:ci-queued-builds',
+        name: 'ci-queued-builds',
+        kind: 'main',
+      },
+    })
   })
 
   it('accepts the longest names SQS allows, and no longer', () => {
-    const arn = (name: string) => `arn:aws:sqs:eu-west-1:123456789012:${name}`
-    assert.ok(queueFromArn(arn('q'.repeat(80))).ok)
-    assert.ok(queueFromArn(arn(`${'q'.repeat(75)}.fifo`)).ok)
-    assert.ok(!queueFromArn(arn('q'.repeat(81))).ok)
-    assert.ok(!queueFromArn(arn(`${'q'.repeat(76)}.fifo`)).ok)
-  })
-
-  it('refuses partitions it has no endpoint for', () => {
-    const queue = queueFromArn('arn:aws-iso:sqs:us-iso-east-1:123456789012:q')
-    assert.ok(!queue.ok)
-    assert.match(queue.error, /partition aws-iso/)
+    assert.ok(queueFromArn(arn('q'.repeat(80)), 'main').ok)
+    assert.ok(queueFromArn(arn(`${'q'.repeat(75)}.fifo`), 'main').ok)
+    assert.ok(!queueFromArn(arn('q'.repeat(81)), 'main').ok)
+    assert.ok(!queueFromArn(arn(`${'q'.repeat(76)}.fifo`), 'main').ok)
+    assert.ok(!queueFromArn(arn('*'), 'main').ok)
   })
 })

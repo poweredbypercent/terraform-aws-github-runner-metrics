@@ -4,16 +4,14 @@ import { SecretsManagerClient } from '@aws-sdk/client-secrets-manager'
 import { SQSClient } from '@aws-sdk/client-sqs'
 import { SSMClient } from '@aws-sdk/client-ssm'
 import { fromNodeProviderChain, fromTemporaryCredentials } from '@aws-sdk/credential-providers'
-import type { AwsCredentialIdentity } from '@smithy/types'
 import { type Cached, cached } from './cache.ts'
-
 import { parseConfig } from './config/parse.ts'
 import type { Config, SigV4Auth } from './config/types.ts'
 import { jsonLogger } from './log.ts'
 import { createVanishTracker } from './model/vanish.ts'
 import type { GitHubSource } from './ports.ts'
 import { type Deps, type Outcome, sampleOnce } from './run.ts'
-import { authFromConfig } from './sinks/auth.ts'
+import { authFromConfig, type CredentialProvider, refreshingCredentials } from './sinks/auth.ts'
 import { remoteWriteSink } from './sinks/remote-write/sink.ts'
 import { readInstances, readQueueAges, readQueueDepths } from './sources/aws.ts'
 import {
@@ -46,12 +44,16 @@ declare const __VERSION__: string
 const VERSION = typeof __VERSION__ === 'string' ? __VERSION__ : 'dev'
 const USER_AGENT = `terraform-aws-github-runner-metrics/${VERSION}`
 /**
- * A secret or the App's credentials, kept for ten minutes before being read again (so a rotation
- * is picked up within that), and not kept at all until there is a value (so a secret filled in
- * after deploy is used at the next sample).
+ * A secret or the App's credentials are kept this long before being read again, so a rotation is
+ * picked up within it.
  */
+const CREDENTIAL_TTL_MS = 10 * 60_000
+/** The writer role's sessions: STS's minimum, refreshed five minutes before they end. */
+const WRITER_SESSION_SECONDS = 900
+
+/** Kept for CREDENTIAL_TTL_MS, and not at all until there is a value (a secret filled in later). */
 const cachedCredential = <T>(load: (signal: AbortSignal) => Promise<T | undefined>) =>
-  cached(load, 10 * 60_000, Date.now)
+  cached(load, CREDENTIAL_TTL_MS, Date.now)
 
 function githubCredentials(
   config: Config,
@@ -75,6 +77,9 @@ function githubCredentials(
         ])
         return credentialsFromRunnerModule(appId, key)
       })
+    default:
+      // A new kind of credentials must be wired here, not silently turn GitHub off.
+      return credentials satisfies never
   }
 }
 
@@ -91,18 +96,23 @@ function githubSource(
   }
 }
 
-/** Both providers cache and refresh by themselves. */
-const writerCredentials = (auth: SigV4Auth): (() => Promise<AwsCredentialIdentity>) =>
+/**
+ * The node provider chain caches by itself; the assume-role provider does not, so it is wrapped:
+ * one STS call per session rather than one per push.
+ */
+const writerCredentials = (auth: SigV4Auth): CredentialProvider =>
   auth.roleArn
-    ? fromTemporaryCredentials({
-        params: {
-          RoleArn: auth.roleArn,
-          RoleSessionName: auth.sessionName,
-          DurationSeconds: 900,
-          ...(auth.externalId ? { ExternalId: auth.externalId } : {}),
-        },
-        clientConfig: { region: auth.region },
-      })
+    ? refreshingCredentials(
+        fromTemporaryCredentials({
+          params: {
+            RoleArn: auth.roleArn,
+            RoleSessionName: auth.sessionName,
+            DurationSeconds: WRITER_SESSION_SECONDS,
+            ...(auth.externalId ? { ExternalId: auth.externalId } : {}),
+          },
+          clientConfig: { region: auth.region },
+        }),
+      )
     : fromNodeProviderChain()
 
 export function buildDeps(env: NodeJS.ProcessEnv): Deps {

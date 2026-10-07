@@ -35,7 +35,7 @@ const config = parseConfig(
         environment: 'e2e',
         max_runners: 8,
         runner_name_prefix: 'linux',
-        queue_arns: [ARN],
+        queues: [{ arn: ARN, kind: 'main' }],
       },
     ],
     remote_write: { url: `${PROMETHEUS}/api/v1/write` },

@@ -1,8 +1,10 @@
-import { scopeApiPath, scopeKey, scopeOwnerName } from '../../domain/scope.ts'
+import { scopeKey, scopeOwnerName } from '../../domain/scope.ts'
 import { readEach } from '../../domain/settle.ts'
 import type { GitHubScope, RegisteredRunner } from '../../domain/types.ts'
 import type { RegisteredRunners } from '../../ports.ts'
 import type { GitHubAppClient } from './client.ts'
+import { scopeApiPath } from './paths.ts'
+import { parseRunnersPage } from './responses.ts'
 
 const PER_PAGE = 100
 
@@ -32,17 +34,11 @@ async function listRunners(
   const base = `${scopeApiPath(scope)}/actions/runners`
   const runners: RegisteredRunner[] = []
   for (let page = 1; ; page++) {
-    const body = (await client.get(scope, `${base}?per_page=${PER_PAGE}&page=${page}`, signal)) as {
-      runners?: { name: string; status: string; busy: boolean }[]
-    }
-    const batch = body.runners ?? []
+    const batch = parseRunnersPage(
+      await client.get(scope, `${base}?per_page=${PER_PAGE}&page=${page}`, signal),
+    )
     for (const r of batch) {
-      runners.push({
-        name: r.name,
-        status: r.status === 'online' ? 'online' : 'offline',
-        busy: r.busy === true,
-        scope,
-      })
+      runners.push({ name: r.name, status: r.online ? 'online' : 'offline', busy: r.busy, scope })
     }
     if (batch.length < PER_PAGE) return runners
   }

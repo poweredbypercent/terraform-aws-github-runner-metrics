@@ -1,7 +1,20 @@
-import type { Config, RunnerConfig } from '../config/types.ts'
 import { instanceIdOfRunnerName, scopeKey } from '../domain/scope.ts'
-import type { GitHubScope, RegisteredRunner, RunnerInstance, Snapshot } from '../domain/types.ts'
+import type {
+  GitHubScope,
+  QueueRef,
+  RegisteredRunner,
+  RunnerConfig,
+  RunnerInstance,
+  Snapshot,
+} from '../domain/types.ts'
 import { type LabelsOf, METRICS, type Sample, sample } from './catalogue.ts'
+
+/** What the model needs to know about the stack, besides the snapshot. */
+export interface SeriesSettings {
+  readonly runnerConfigs: readonly RunnerConfig[]
+  /** Instances younger than this are always unregistered; they are not counted as booting. */
+  readonly bootGraceSeconds: number
+}
 
 /**
  * A snapshot of the runner stack, as series. Pure: everything it needs is in its arguments.
@@ -12,7 +25,7 @@ import { type LabelsOf, METRICS, type Sample, sample } from './catalogue.ts'
  * runners) are filled with zeros so a quiet runner config still reports; label sets that come and
  * go (instance types, owners) are left to the vanish tracker.
  */
-export function buildSeries(config: Config, snapshot: Snapshot): Sample[] {
+export function buildSeries(config: SeriesSettings, snapshot: Snapshot): Sample[] {
   const { now } = snapshot
   const series: Sample[] = []
   const byEnvironment = new Map(config.runnerConfigs.map(c => [c.environment, c]))
@@ -40,13 +53,9 @@ export function buildSeries(config: Config, snapshot: Snapshot): Sample[] {
 
   if (snapshot.ages) {
     for (const { c, queue } of queuesOf(config)) {
-      const age = snapshot.ages.get(queue.arn)
+      const reported = snapshot.ages.get(queue.arn)
+      const age = reported === undefined ? undefined : ageOf(queue, reported, snapshot.depths)
       if (age === undefined) continue
-      // CloudWatch has no datapoints for a queue that does not exist either; once SQS has said
-      // which queues exist, a dead-letter queue that is not among them gets no age.
-      if (queue.kind === 'dead_letter' && snapshot.depths?.values.has(queue.arn) === false) {
-        continue
-      }
       series.push(sample(METRICS.queueAge, { ...baseLabels(c), queue: queue.kind }, age, now))
     }
   }
@@ -73,11 +82,25 @@ type ByEnvironment = ReadonlyMap<string, RunnerConfig>
 
 const baseLabels = (c: RunnerConfig) => ({ environment: c.environment, runner_config: c.name })
 
-const queuesOf = (config: Config) =>
+const queuesOf = (config: SeriesSettings) =>
   config.runnerConfigs.flatMap(c => c.queues.map(queue => ({ c, queue })))
 
+/**
+ * CloudWatch's age of the oldest message, checked against what SQS said in the same sample. A
+ * queue SQS found empty has no oldest message, whatever CloudWatch last published: SQS stops
+ * publishing once a queue drains, so its last datapoint would linger. A queue SQS says does not
+ * exist has no age at all (CloudWatch has no datapoints for it either, which reads as zero). A
+ * queue SQS could not read keeps CloudWatch's answer.
+ */
+function ageOf(queue: QueueRef, reported: number, depths: Snapshot['depths']): number | undefined {
+  if (!depths) return reported
+  const depth = depths.values.get(queue.arn)
+  if (depth) return depth.visible + depth.inFlight + depth.delayed === 0 ? 0 : reported
+  return depths.failed.some(f => f.key === queue.arn) ? reported : undefined
+}
+
 function instanceSeries(
-  config: Config,
+  config: SeriesSettings,
   byEnvironment: ByEnvironment,
   instances: readonly RunnerInstance[],
   now: number,
@@ -119,7 +142,7 @@ function instanceSeries(
  * be placed (another stack's, a laptop) are not this sampler's to count.
  */
 function placeRunner(
-  config: Config,
+  config: SeriesSettings,
   byEnvironment: ByEnvironment,
   runner: RegisteredRunner,
   environmentOfInstance: ReadonlyMap<string, string>,
@@ -141,7 +164,7 @@ const scopeLabels = (scope: GitHubScope) => ({
 })
 
 function runnerSeries(
-  config: Config,
+  config: SeriesSettings,
   byEnvironment: ByEnvironment,
   byScope: ReadonlyMap<string, readonly RegisteredRunner[]>,
   instances: readonly RunnerInstance[],
@@ -190,22 +213,25 @@ function runnerSeries(
 }
 
 /**
- * Instances that have not registered yet, joined by instance id rather than by subtracting counts
- * (which lags and goes negative). Only for runner configs whose instances all have a scope that
- * was read this sample: an instance whose scope failed, or carries no ghr:Owner tag, cannot be
- * checked, and an unknown count is left out rather than guessed.
+ * Instances whose runner is not online yet, joined by instance id rather than by subtracting
+ * counts (which lags and goes negative). Online, not merely registered: with JIT configuration
+ * (the runner module's default for ephemeral runners) the scale-up Lambda registers the runner
+ * before the instance has booted, and it stays offline until the agent connects. Only for runner
+ * configs whose instances all have a scope that was read this sample: an instance whose scope
+ * failed, or carries no ghr:Owner tag, cannot be checked, and an unknown count is left out rather
+ * than guessed.
  */
 function bootingSeries(
-  config: Config,
+  config: SeriesSettings,
   instances: readonly RunnerInstance[],
   runners: NonNullable<Snapshot['runners']>,
   now: number,
 ): Sample[] {
-  const registered = new Set<string>()
+  const online = new Set<string>()
   for (const list of runners.values.values()) {
     for (const r of list) {
-      const id = instanceIdOfRunnerName(r.name)
-      if (id) registered.add(id)
+      const id = r.status === 'online' ? instanceIdOfRunnerName(r.name) : undefined
+      if (id) online.add(id)
     }
   }
   const grace = config.bootGraceSeconds * 1000
@@ -215,7 +241,7 @@ function bootingSeries(
     const checkable = mine.every(i => i.scope && runners.values.has(scopeKey(i.scope)))
     if (!checkable) continue
     const booting = mine.filter(
-      i => !registered.has(i.id) && (i.launchTime === undefined || now - i.launchTime >= grace),
+      i => !online.has(i.id) && (i.launchTime === undefined || now - i.launchTime >= grace),
     ).length
     series.push(sample(METRICS.bootingRunners, baseLabels(c), booting, now))
   }

@@ -73,7 +73,7 @@ export const METRICS = {
   ),
   queueAge: define(
     'scale_up_queue_oldest_message_age_seconds',
-    'Age of the oldest message in the queue (CloudWatch ApproximateAgeOfOldestMessage, about a minute behind). Grows while depth stays flat when scale-up keeps failing.',
+    'Age of the oldest message in the queue (CloudWatch ApproximateAgeOfOldestMessage, about a minute behind; 0 as soon as SQS finds the queue empty). Grows while depth stays flat when scale-up keeps failing.',
     [...CONFIG, 'queue'],
     'cloudwatch',
   ),
@@ -91,7 +91,7 @@ export const METRICS = {
   ),
   bootingRunners: define(
     'booting_runners',
-    'Instances launched more than the boot grace period ago that have not registered with GitHub yet. Needs both EC2 and GitHub; not reported when either failed.',
+    'Instances launched more than the boot grace period ago whose runner is not online with GitHub yet (with JIT configuration it is registered, offline, before the instance boots). Needs both EC2 and GitHub; not reported when either failed.',
     CONFIG,
     'github',
   ),
@@ -110,7 +110,7 @@ export const METRICS = {
   ),
   offlineRunners: dynamic(
     'offline_runners',
-    'Registered runners GitHub reports offline.',
+    'Registered runners GitHub reports offline, including JIT runners whose instance is still booting. A runner whose instance has gone is counted only when its runner_name_prefix belongs to one runner config.',
     RUNNERS,
     'github',
   ),
@@ -122,7 +122,7 @@ export const METRICS = {
   ),
   lastSampleTimestamp: define(
     'last_sample_timestamp_seconds',
-    'When this sample was taken (Unix seconds). Alert on time() minus this to catch a sampler that has stopped.',
+    'When this sample was taken (Unix seconds). To catch a sampler that has stopped, alert on absent_over_time() of this series: it disappears when sampling stops.',
     [],
     'sampler',
   ),

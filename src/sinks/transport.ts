@@ -5,6 +5,8 @@ import type { Fetch } from '../http.ts'
  * One HTTP POST with the remote-write retry rules:
  *
  *  - 2xx: done.
+ *  - 3xx: not followed, and not retried. A redirect would carry the signed headers and the body
+ *    to wherever it points; remote_write.url must be the endpoint itself.
  *  - 4xx (429 included): not retried. A 400 is usually an out-of-order or duplicate sample, and
  *    resending the same timestamps can only fail again; the next scheduled sample is the retry.
  *  - 5xx or a network error: retried once after a short pause, within the timeout.
@@ -53,11 +55,15 @@ export async function post(
         method: 'POST',
         headers: request.headers,
         body: request.body,
+        redirect: 'manual',
         signal: AbortSignal.timeout(Math.max(deadline - Date.now(), 1)),
       })
       if (response.ok) return
+      const redirected = response.status >= 300 && response.status < 400
       failure = new PushError(
-        `remote_write: ${response.status}${await explain(response)}`,
+        redirected
+          ? `remote_write: ${response.status} redirect not followed; set remote_write.url to the endpoint itself`
+          : `remote_write: ${response.status}${await explain(response)}`,
         response.status,
       )
       retryable = response.status >= 500
