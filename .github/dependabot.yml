@@ -10,6 +10,10 @@ updates:
         patterns: ['@aws-sdk/*', '@smithy/*']
       tooling:
         dependency-type: development
+    ignore:
+      # The typings follow the oldest Lambda runtime offered (nodejs22.x), not the newest Node.
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
 
   - package-ecosystem: github-actions
     directory: /
@@ -20,6 +24,17 @@ updates:
         patterns: ['*']
 
   - package-ecosystem: terraform
-    directories: ['/', '/modules/download-lambda', '/examples/*']
+    directories: ['/', '/modules/download-lambda', '/examples/multi-runner-amp']
     schedule: { interval: weekly }
     cooldown: { default-days: 7 }
+
+  # The example that proves the runner module v6 on AWS provider 5.x: kept on those majors.
+  - package-ecosystem: terraform
+    directory: /examples/single-runner-grafana-cloud
+    schedule: { interval: weekly }
+    cooldown: { default-days: 7 }
+    ignore:
+      - dependency-name: github-aws-runners/github-runner/aws
+        update-types: ['version-update:semver-major']
+      - dependency-name: hashicorp/aws
+        update-types: ['version-update:semver-major']

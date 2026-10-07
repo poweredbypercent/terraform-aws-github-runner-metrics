@@ -1,9 +1,11 @@
 name: Release
 
-# Pushing a tag vX.Y.Z (matching package.json's version, on main) builds the Lambda zip, attests
-# its build provenance, and publishes a GitHub release with the zip and its SHA-256. There are no
-# floating vX / vX.Y tags: consumers pin vX.Y.Z, and the workflow never writes a tag, so the
-# built-in token is enough and the tag ruleset needs no bypass for automation.
+# Pushing a tag vX.Y.Z (matching package.json's version, on main) builds the Lambda zip and, once
+# a reviewer approves the release environment, attests its build provenance and publishes a GitHub
+# release with the zip and its SHA-256. The attestation comes after the approval, so a build that
+# was never approved has none. There are no floating vX / vX.Y tags: consumers pin vX.Y.Z, and the
+# workflow never writes a tag, so the built-in token is enough and the tag ruleset needs no bypass
+# for automation. Re-running a failed publish finishes the same release.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+', 'v[0-9]+.[0-9]+.[0-9]+-*']
@@ -27,8 +29,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     outputs:
       sha256: ${{ steps.zip.outputs.sha256 }}
     steps:
@@ -53,9 +53,6 @@ jobs:
         run: |
           npm run --silent zip
           echo "sha256=$(cut -d' ' -f1 dist/terraform-aws-github-runner-metrics.zip.sha256)" >>"${GITHUB_OUTPUT}"
-      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: dist/terraform-aws-github-runner-metrics.zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release
@@ -73,6 +70,8 @@ jobs:
     environment: release
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.ref_name }}
@@ -85,6 +84,12 @@ jobs:
         with:
           name: release
           path: assets
+      # The zip published, and attested, is the one the build job hashed: nothing swapped between.
+      - name: The zip is the one built
+        run: echo "${SHA256}  assets/terraform-aws-github-runner-metrics.zip" | sha256sum -c -
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: assets/terraform-aws-github-runner-metrics.zip
       - name: Publish the release
         run: |
           gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" -f tag_name="${TAG}" --jq .body >notes.md
@@ -112,6 +117,12 @@ jobs:
           prerelease=""
           [[ "${TAG}" == *-* ]] && prerelease="--prerelease"
           # Draft first and publish once every asset is attached, so the release is complete the
-          # moment it appears (and works with immutable releases).
-          gh release create "${TAG}" --draft --verify-tag --title "${TAG}" --notes-file notes.md ${prerelease} assets/*
+          # moment it appears (and works with immutable releases). A re-run finishes a draft an
+          # earlier run left, and leaves a published release alone: it can no longer change.
+          draft="$(gh release view "${TAG}" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
+          case "${draft}" in
+            false) echo "${TAG} is already published"; exit 0 ;;
+            true) gh release upload "${TAG}" assets/* --clobber ;;
+            *) gh release create "${TAG}" --draft --verify-tag --title "${TAG}" --notes-file notes.md ${prerelease} assets/* ;;
+          esac
           gh release edit "${TAG}" --draft=false

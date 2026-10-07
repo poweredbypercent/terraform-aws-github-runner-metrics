@@ -105,8 +105,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The tests use plan-time overrides, which need Terraform 1.11.
-        terraform: ['1.11.4', 'latest']
+        # 1.7 is the first Terraform with mock providers; the one test that also needs plan-time
+        # overrides (1.11) is set aside there. Below 1.7 the module is only validated (above).
+        terraform: ['1.7.5', '1.11.4', 'latest']
         aws: ['= 5.77.0', '~> 5.77', '~> 6.0']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -121,6 +122,10 @@ jobs:
           CONSTRAINT: ${{ matrix.aws }}
         run: |
           printf 'terraform {\n  required_providers {\n    aws = { source = "hashicorp/aws", version = "%s" }\n  }\n}\n' "${CONSTRAINT}" >ci_aws_provider_override.tf
+      # Terraform before 1.11 cannot even parse it, so it would fail init, not just the run.
+      - name: Set aside the test that needs Terraform 1.11
+        if: matrix.terraform == '1.7.5'
+        run: rm created_secret.tftest.hcl
       - run: terraform init -backend=false -input=false
       - run: terraform test
 
@@ -136,6 +141,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Terraform and tflint float to their latest releases on purpose, here and in lint: the
+      # examples are what users copy, so a new release that breaks them should show up here first.
       - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_wrapper: false
@@ -174,11 +181,35 @@ jobs:
           output-method: inject
           fail-on-diff: true
 
-  # The one check to require in branch protection: renaming or adding a job above cannot quietly
-  # leave main unprotected.
+  # The workflows themselves, on every change: release.yml publishes what consumers run, so a
+  # finding here blocks the merge like any other failure.
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        run: docker run --rm -v "${PWD}:/repo" -w /repo rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+
+  zizmor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Findings fail the job rather than becoming code-scanning alerts, so they gate the merge.
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          advanced-security: false
+
+  # The one check to require in branch protection. Every job above must be in `needs`
+  # (scripts/ci.test.ts checks it), so adding a job cannot quietly leave it unrequired.
   ci-ok:
     if: always()
-    needs: [node, e2e, terraform-validate, terraform-test, examples, lint]
+    needs: [node, e2e, terraform-validate, terraform-test, examples, lint, actionlint, zizmor]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
