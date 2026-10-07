@@ -13,6 +13,12 @@ variable "subnet_ids" {
   type        = list(string)
 }
 
+variable "runner_lambda_zips_dir" {
+  description = "Where the runner module's own Lambda zips (webhook, runners, runner-binaries-syncer) of release v6.5.9 were downloaded."
+  type        = string
+  default     = "lambdas"
+}
+
 variable "github_app" {
   description = "The runner module's GitHub App (it registers runners)."
   type = object({

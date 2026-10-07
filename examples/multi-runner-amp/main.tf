@@ -9,8 +9,8 @@ resource "random_id" "webhook_secret" {
   byte_length = 20
 }
 
-# A runner stack as terraform-aws-github-runner documents it (lambda zips and AMIs omitted: see
-# that module's examples).
+# A runner stack as terraform-aws-github-runner documents it. Its Lambda zips are downloaded
+# beforehand (README.md): the runner module hashes them when it plans.
 module "runners" {
   source  = "github-aws-runners/github-runner/aws//modules/multi-runner"
   version = "7.11.0"
@@ -19,6 +19,10 @@ module "runners" {
   vpc_id     = var.vpc_id
   subnet_ids = var.subnet_ids
   prefix     = "ci"
+
+  webhook_lambda_zip                = "${var.runner_lambda_zips_dir}/webhook.zip"
+  runner_binaries_syncer_lambda_zip = "${var.runner_lambda_zips_dir}/runner-binaries-syncer.zip"
+  runners_lambda_zip                = "${var.runner_lambda_zips_dir}/runners.zip"
 
   github_app = {
     id             = var.github_app.id

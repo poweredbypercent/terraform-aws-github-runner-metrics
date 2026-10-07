@@ -12,7 +12,15 @@ runner config, sampled by this module and pushed to Grafana Cloud.
 - GitHub is read through a dedicated read-only App whose credentials are in a secret you manage
   (`github_app_metrics_secret_arn`). Only `github_owners` are queried.
 
+The runner module hashes its own Lambda zips when it plans, so download them first, into
+`runner_lambda_zips_dir` (its `examples/lambdas-download` does the same):
+
 ```sh
+mkdir -p lambdas
+for name in webhook runners runner-binaries-syncer; do
+  curl -fL -o "lambdas/${name}.zip" \
+    "https://github.com/github-aws-runners/terraform-aws-github-runner/releases/download/v6.5.9/${name}.zip"
+done
 terraform init
 terraform apply
 terraform output runner_configs   # what the module read from the stack

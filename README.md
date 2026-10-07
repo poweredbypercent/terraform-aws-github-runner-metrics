@@ -20,7 +20,7 @@ Where a job can be on its way to a runner, and how each stage shows:
 | Waiting for the scale-up Lambda, or backing off at the runner cap or a capacity error | SQS | `github_aws_runners_scale_up_queue_messages{queue="main"}` |
 | Failed scale-up repeatedly; will not get a runner | SQS | `github_aws_runners_scale_up_queue_messages{queue="dead_letter"}` |
 | How long the oldest job has waited | CloudWatch | `github_aws_runners_scale_up_queue_oldest_message_age_seconds` |
-| Instance launched, runner not registered yet | EC2 joined to GitHub by instance id | `github_aws_runners_booting_runners` |
+| Instance launched, runner not online yet | EC2 joined to GitHub by instance id | `github_aws_runners_booting_runners` |
 | Registered: running a job, idle (a warm pool), offline | GitHub | `github_aws_runners_{busy,idle,offline,registered}_runners` |
 
 Plus runner instances by type, purchase option and state, orphaned instances, each runner config's
@@ -44,9 +44,13 @@ EventBridge (every minute)
 
 The runner configs - their environment, cap, runner name prefix, queues and GitHub Enterprise Server
 URL - are read from each runner config's scale-up Lambda in the stack's outputs, for both the root
-module and `modules/multi-runner`. Organisations and repositories to ask GitHub about are read from
-the instances' `ghr:Type` and `ghr:Owner` tags, so organisation and repository runners both work
-with nothing to configure.
+module and `modules/multi-runner`. The organisations and repositories to ask GitHub about come from
+the instances' `ghr:Type` and `ghr:Owner` tags, limited to the ones you allow in
+`github_app.owners`; organisation and repository runners both work.
+
+A configuration the Lambda could not run with - no runner configs, a runner config without an
+environment, a name or environment given twice, an invalid label - fails the plan (or the apply,
+for values only known then) rather than deploying a function that fails every minute.
 
 ## Usage
 
@@ -62,7 +66,7 @@ module "runner_metrics" {
 
   # modules/multi-runner:
   runner_stacks = [{ multi_runner = module.runners.runners_map }]
-  # or the root module:
+  # or the root module, named (it is the runner_config label):
   # runner_stacks = [{ name = "ci", runners = module.runner.runners, queues = module.runner.queues }]
 
   remote_write = {
@@ -94,7 +98,12 @@ provenance attestation. Either:
 - use `modules/download-lambda`, which downloads an exact release and refuses it unless it matches
   the SHA-256 you pin, its attestation (`verify_attestation = true`), or both - one is required -
   and verifies the zip on disk again on every plan; or
-- copy the zip to your own S3 bucket and pass `lambda_zip = { s3 = { bucket, key, object_version } }`.
+- copy the zip to your own S3 bucket and pass `lambda_zip = { s3 = { bucket, key, object_version } }`;
+  the version is required, so exactly the object you verified is deployed.
+
+The SHA-256 pin covers the zip. The module's own code, `download.sh` included, comes from the
+`?ref=` you give the module source and runs where Terraform plans: pin it to the commit the tag
+points at (`?ref=<commit SHA>`) if you do not want to rely on tags being immutable.
 
 Verify a release by hand with `sha256sum -c` and:
 
@@ -119,7 +128,7 @@ dedicated, read-only one:
 3. Put its id and key in the secret the module created (`github_app_secret_name` output):
 
    ```sh
-   jq -n --arg id "<app id>" --rawfile key app.private-key.pem '{app_id: $id, private_key: $key}' >github-app.json
+   (umask 077 && jq -n --arg id "<app id>" --rawfile key app.private-key.pem '{app_id: $id, private_key: $key}' >github-app.json)
    aws secretsmanager put-secret-value --secret-id <github_app_secret_name> --secret-string file://github-app.json
    rm github-app.json
    ```
@@ -159,12 +168,13 @@ For AMP in another account, the writer role trusts the Lambda's role (`lambda_ro
 Apply this module first: a trust policy cannot name a role that does not exist yet.
 
 Pushes use remote write 1.0. A rejected push (4xx) is not retried - the next sample is - and the
-function is not retried by EventBridge either, so samples always arrive in order.
+function is not retried by EventBridge either, so samples always arrive in order. Redirects are not
+followed: `remote_write.url` must be the endpoint itself.
 
 ## Useful queries
 
 ```promql
-# Jobs waiting for a runner, by runner config: still queued, plus launched but not registered.
+# Jobs waiting for a runner, by runner config: still queued, plus launched but not online yet.
 # Booting is left out whenever GitHub is unavailable; `or` falls back to the queue alone.
 sum by (runner_config) (github_aws_runners_scale_up_queue_messages{queue="main"})
   + sum by (runner_config) (github_aws_runners_booting_runners)
@@ -176,11 +186,16 @@ sum by (runner_config) (github_aws_runners_scale_up_queue_messages{queue="dead_l
 # The oldest waiting job, in seconds
 max by (runner_config) (github_aws_runners_scale_up_queue_oldest_message_age_seconds{queue="main"})
 
-# How full each runner config is
-sum by (runner_config) (github_aws_runners_instances) / on (runner_config) github_aws_runners_capacity
+# How full each runner config is. Orphans count against the cap like any instance; the runner
+# module applies the cap per owner, so with repository runners in several repositories this is
+# an average, and can pass 1.
+(
+  sum by (runner_config) (github_aws_runners_instances)
+  + sum by (runner_config) (github_aws_runners_orphan_instances)
+) / on (runner_config) github_aws_runners_capacity
 
-# The sampler stopped (alert on this, not on missing data)
-time() - max(github_aws_runners_last_sample_timestamp_seconds) > 300
+# The sampler stopped: its series disappear, so alert on their absence.
+absent_over_time(github_aws_runners_last_sample_timestamp_seconds[10m])
 ```
 
 ## Limitations
@@ -190,13 +205,15 @@ time() - max(github_aws_runners_last_sample_timestamp_seconds) > 300
   scale-up hit an unexpected error is removed from the queue by the runner module.
 - With `enable_job_queued_check` off, a job an idle pool runner took still launches an instance:
   booting counts instances, so it can overstate demand briefly.
+- A registered runner is placed in a runner config through its instance. Once the instance has
+  gone (an offline runner left behind by a spot interruption), it is placed only by a
+  `runner_name_prefix` that belongs to one runner config; with the default empty prefix it is not
+  counted in `offline_runners`.
 - The GitHub App must be installed on every organisation or repository in `owners`; runners
   registering anywhere else are not counted, and booting is not reported for their runner config.
 - Lambda environment variables are limited to 4 KB: around a dozen runner configs per module
   instance.
 - One region per module instance: the queues must be in the region it is deployed in.
-- A multi-runner config with a FIFO build queue (`enable_fifo_build_queue`): its queue names are
-  derived without `.fifo`, so describe it in `runner_configs` with its `queue_arns`.
 - `github_app.source = "runner_ssm"` reads one App; with the runner module's several-App rotation
   (v7.11), the first.
 
@@ -208,10 +225,15 @@ the two complement each other. It covers the fleet monitoring asked for in
 [github-aws-runners/terraform-aws-github-runner#2025](https://github.com/github-aws-runners/terraform-aws-github-runner/issues/2025).
 For how it compares with exporters you may already run (YACE, GitHub runner exporters), and when
 one of those is enough, see [docs/alternatives.md](docs/alternatives.md).
-CI validates the examples against the runner module v6.5 (AWS provider 5.x) and v7.11 (6.x), the
-module with Terraform 1.5 and the latest release on both provider majors (and the 5.77 floor), and
-runs the module's `terraform test` suite on Terraform 1.11 and later; the Lambda's tests run on
-Node 22 and 24, its runtimes.
+
+## Compatibility
+
+| | Tested in CI |
+| --- | --- |
+| terraform-aws-github-runner | v6.5 on AWS provider 5.x, v7.11 on 6.x (both examples) |
+| Terraform | validated on 1.5 and the latest release; `terraform test` on 1.7, 1.11 and the latest |
+| AWS provider | 5.77 (the floor), the latest 5.x and the latest 6.x |
+| Lambda runtime | Node.js 22 and 24 (`lambda_runtime`) |
 
 ## Development
 
@@ -270,25 +292,25 @@ No modules.
 
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
-| lambda\_zip | The function code: a release zip of this module's version. Either a local file (path; use<br/>modules/download-lambda to fetch and verify one) or an object in S3. Pin the S3 object\_version,<br/>or a changed object is not deployed. | <pre>object({<br/>    path             = optional(string)<br/>    source_code_hash = optional(string)<br/>    s3 = optional(object({<br/>      bucket         = string<br/>      key            = string<br/>      object_version = optional(string)<br/>    }))<br/>  })</pre> | n/a | yes |
-| remote\_write | The Prometheus remote\_write endpoint, and how to authenticate to it. At most one of:<br/><br/>  sigv4    Amazon Managed Service for Prometheus. role\_arn: a writer role to assume (for a<br/>           workspace in another account); without it the Lambda's own role signs, and needs<br/>           aps:RemoteWrite (see additional\_policy\_json).<br/>  basic    a Secrets Manager secret with {"username": "...", "password": "..."} (Grafana Cloud).<br/>  bearer   a Secrets Manager secret with {"token": "..."} or the bare token.<br/><br/>headers: plain, non-secret extras such as X-Scope-OrgID for Mimir; they are visible in the<br/>function's configuration, so never put credentials there. | <pre>object({<br/>    url = string<br/>    auth = optional(object({<br/>      sigv4 = optional(object({<br/>        region      = optional(string)<br/>        service     = optional(string, "aps")<br/>        role_arn    = optional(string)<br/>        external_id = optional(string)<br/>      }))<br/>      basic  = optional(object({ secret_arn = string }))<br/>      bearer = optional(object({ secret_arn = string }))<br/>    }), {})<br/>    headers         = optional(map(string), {})<br/>    timeout_seconds = optional(number, 10)<br/>  })</pre> | n/a | yes |
+| lambda\_zip | The function code: a release zip of this module's version. Either a local file (path; use<br/>modules/download-lambda to fetch and verify one) or an object in S3, pinned by its<br/>object\_version: the function runs with access to the GitHub App's key, so it deploys exactly the<br/>object you verified, and a new version is deployed by changing it. | <pre>object({<br/>    path             = optional(string)<br/>    source_code_hash = optional(string)<br/>    s3 = optional(object({<br/>      bucket         = string<br/>      key            = string<br/>      object_version = string<br/>    }))<br/>  })</pre> | n/a | yes |
+| remote\_write | The Prometheus remote\_write endpoint, and how to authenticate to it. At most one of:<br/><br/>  sigv4    Amazon Managed Service for Prometheus. role\_arn: a writer role to assume (for a<br/>           workspace in another account); without it the Lambda's own role signs, and needs<br/>           aps:RemoteWrite (see additional\_policy\_json).<br/>  basic    a Secrets Manager secret with {"username": "...", "password": "..."} (Grafana Cloud).<br/>  bearer   a Secrets Manager secret with {"token": "..."} or the bare token.<br/><br/>headers: plain, non-secret extras such as X-Scope-OrgID for Mimir; they are visible in the<br/>function's configuration, so a header named like a credential (key, token, secret, auth...)<br/>is refused.<br/><br/>The URL must be the endpoint itself: a redirect is not followed. With sigv4 and no region, the<br/>region is read from an AWS hostname (an AMP or VPC endpoint URL). | <pre>object({<br/>    url = string<br/>    auth = optional(object({<br/>      sigv4 = optional(object({<br/>        region      = optional(string)<br/>        service     = optional(string, "aps")<br/>        role_arn    = optional(string)<br/>        external_id = optional(string)<br/>      }))<br/>      basic  = optional(object({ secret_arn = string }))<br/>      bearer = optional(object({ secret_arn = string }))<br/>    }), {})<br/>    headers         = optional(map(string), {})<br/>    timeout_seconds = optional(number, 10)<br/>  })</pre> | n/a | yes |
 | additional\_policy\_json | Extra IAM policy for the function's role, for example aps:RemoteWrite on a same-account workspace when no sigv4.role\_arn is used. | `string` | `null` | no |
 | boot\_grace\_seconds | Instances younger than this are not counted as booting: they are always unregistered. | `number` | `30` | no |
-| github\_app | Where the GitHub App credentials that read registered runners (busy, idle, offline, booting)<br/>come from:<br/><br/>  create\_secret     (default) the module creates an empty Secrets Manager secret; put<br/>                    {"app\_id": "...", "private\_key": "<PEM>"} in it. Until then GitHub is skipped.<br/>  existing\_secret   a secret you manage, same JSON, in secret\_arn.<br/>  runner\_ssm        the runner module's own App, from its SSM parameters. Works, but that App<br/>                    can register runners: more access than reading them needs.<br/>  disabled          no GitHub: queue, instance and capacity metrics only.<br/><br/>The recommended App is dedicated and read-only: organisation "Self-hosted runners: Read", plus<br/>repository "Administration: Read" for repository-level runners.<br/><br/>owners (required unless disabled): the organisations or "owner/repo" targets to query; matched<br/>without regard to case. The instances' ghr:Owner tags say where each runner registers, and a<br/>job that can tag its own instance could otherwise point the App at another organisation it is<br/>installed on.<br/><br/>A customer-managed key on an existing secret goes in secrets\_kms\_key\_arns. | <pre>object({<br/>    source                  = optional(string, "create_secret")<br/>    secret_arn              = optional(string)<br/>    recovery_window_in_days = optional(number, 30)<br/>    ssm = optional(object({<br/>      app_id_parameter_name             = string<br/>      private_key_base64_parameter_name = string<br/>    }))<br/>    owners = optional(list(string), [])<br/>  })</pre> | `{}` | no |
+| github\_app | Where the GitHub App credentials that read registered runners (busy, idle, offline, booting)<br/>come from:<br/><br/>  create\_secret     (default) the module creates an empty Secrets Manager secret; put<br/>                    {"app\_id": "...", "private\_key": "<PEM>"} in it. Until then GitHub is skipped.<br/>  existing\_secret   a secret you manage, same JSON, in secret\_arn.<br/>  runner\_ssm        the runner module's own App, from its SSM parameters. Works, but that App<br/>                    can register runners: more access than reading them needs.<br/>  disabled          no GitHub: queue, instance and capacity metrics only.<br/><br/>The recommended App is dedicated and read-only: organisation "Self-hosted runners: Read", plus<br/>repository "Administration: Read" for repository-level runners.<br/><br/>owners (required unless disabled): the organisations or "owner/repo" targets to query; matched<br/>without regard to case. The instances' ghr:Owner tags say where each runner registers, and a<br/>job that can tag its own instance could otherwise point the App at another organisation it is<br/>installed on.<br/><br/>ssm (runner\_ssm only): the runner module's parameter names, { app\_id\_parameter\_name,<br/>private\_key\_base64\_parameter\_name }, when they cannot be read from the runner stacks.<br/><br/>recovery\_window\_in\_days (create\_secret only): how long a destroyed secret can be restored, 0 or<br/>7-30. While it lasts, its name cannot be used again, so a destroy and re-apply of the same<br/>name\_prefix fails; set 0 where that matters.<br/><br/>A customer-managed key on an existing secret goes in secrets\_kms\_key\_arns. | <pre>object({<br/>    source                  = optional(string, "create_secret")<br/>    secret_arn              = optional(string)<br/>    recovery_window_in_days = optional(number, 30)<br/>    ssm = optional(object({<br/>      app_id_parameter_name             = string<br/>      private_key_base64_parameter_name = string<br/>    }))<br/>    owners = optional(list(string), [])<br/>  })</pre> | `{}` | no |
 | github\_enterprise\_server\_url | GitHub Enterprise Server base URL (e.g. https://github.example.com) for every stack, overriding what the runner stacks say. null: from each stack, else github.com. | `string` | `null` | no |
 | iam\_role\_path | Path for the function's role. | `string` | `"/"` | no |
 | kms\_key\_arn | Customer-managed KMS key for the log group, the function's environment and the created secret. The key policy must allow logs.<region>.amazonaws.com. null: AWS-managed keys. | `string` | `null` | no |
-| labels | Constant labels added to every series, for example { cluster = "ci" }. | `map(string)` | `{}` | no |
+| labels | Constant labels added to every series, for example { cluster = "ci" }: Prometheus label names, not a built-in label, non-empty values. | `map(string)` | `{}` | no |
 | lambda\_architecture | arm64 or x86\_64; the code is plain JavaScript and runs on either. | `string` | `"arm64"` | no |
 | lambda\_memory\_size | Memory in MB. The bundled AWS SDK starts faster with a little more than the minimum. | `number` | `256` | no |
 | lambda\_runtime | nodejs22.x works with every supported AWS provider; nodejs24.x needs one that knows it. | `string` | `"nodejs22.x"` | no |
-| lambda\_timeout | Seconds. Keep it under the schedule interval so samples never overlap, and long enough for a slow sample: 2 x source\_timeout\_seconds + remote\_write.timeout\_seconds + 5 (checks.tf). | `number` | `45` | no |
+| lambda\_timeout | Seconds. Keep it under the schedule interval so samples never overlap, and long enough for a slow sample: at least 2 x source\_timeout\_seconds + remote\_write.timeout\_seconds + 5, which the module enforces. | `number` | `45` | no |
 | log\_retention\_in\_days | CloudWatch Logs retention for the function's log group. | `number` | `30` | no |
 | name\_prefix | Names the function, role, schedule, log group and secret. | `string` | `"github-runner-metrics"` | no |
 | permissions\_boundary\_arn | Permissions boundary for the function's role. | `string` | `null` | no |
 | reserved\_concurrent\_executions | 1 keeps samples from overlapping (remote write rejects out-of-order samples) and keeps the caches in one warm container. -1 removes the reservation, for accounts with no concurrency to spare. | `number` | `1` | no |
-| runner\_configs | Runner configs given explicitly, for stacks whose outputs are not to hand (another state, another<br/>tool). The key is the runner\_config label. `environment` is the stack's ghr:environment tag<br/>value; the queues default to "<environment>-queued-builds" and its "\_dead\_letter" queue in this<br/>account and region. | <pre>map(object({<br/>    environment        = string<br/>    max_runners        = optional(number, -1)<br/>    runner_name_prefix = optional(string, "")<br/>    github_api_url     = optional(string)<br/>    queue_arns         = optional(list(string))<br/>    labels             = optional(map(string), {})<br/>  }))</pre> | `{}` | no |
-| runner\_stacks | Runner stacks built with terraform-aws-github-runner, passed straight from their outputs so<br/>nothing has to be copied by hand:<br/><br/>  { multi\_runner = module.runners.runners\_map }                     # modules/multi-runner<br/>  { runners = module.runner.runners, queues = module.runner.queues } # the root module<br/><br/>Each runner config's environment, runner cap, runner name prefix, queues and GitHub Enterprise<br/>Server URL are read from its scale-up Lambda's configuration. `name` is the runner\_config label<br/>for a root-module stack (multi-runner stacks use their map keys); `labels` are added to that<br/>stack's series. | <pre>list(object({<br/>    name         = optional(string)<br/>    multi_runner = optional(any)<br/>    runners      = optional(any)<br/>    queues       = optional(any)<br/>    labels       = optional(map(string), {})<br/>  }))</pre> | `[]` | no |
+| runner\_configs | Runner configs given explicitly, for stacks whose outputs are not to hand (another state, another<br/>tool). The key is the runner\_config label. `environment` is the stack's ghr:environment tag<br/>value. `queues` defaults to "<environment>-queued-builds" and its "\_dead\_letter" queue in this<br/>account and region; give them for queues named otherwise, as<br/>{ main = "<ARN>", dead\_letter = "<ARN>" } with dead\_letter optional. `max_runners` -1 is<br/>unlimited. `labels` are added to this runner config's series (Prometheus label names, not a<br/>built-in label, non-empty values). | <pre>map(object({<br/>    environment        = string<br/>    max_runners        = optional(number, -1)<br/>    runner_name_prefix = optional(string, "")<br/>    github_api_url     = optional(string)<br/>    queues = optional(object({<br/>      main        = string<br/>      dead_letter = optional(string)<br/>    }))<br/>    labels = optional(map(string), {})<br/>  }))</pre> | `{}` | no |
+| runner\_stacks | Runner stacks built with terraform-aws-github-runner, passed straight from their outputs so<br/>nothing has to be copied by hand:<br/><br/>  { multi\_runner = module.runners.runners\_map }                     # modules/multi-runner<br/>  { runners = module.runner.runners, queues = module.runner.queues } # the root module<br/><br/>Each runner config's environment, runner cap, runner name prefix, queues and GitHub Enterprise<br/>Server URL are read from its scale-up Lambda's configuration. `name` is the runner\_config label<br/>of a root-module stack, and required for one (multi-runner stacks use their map keys); `labels`<br/>are added to that stack's series. | <pre>list(object({<br/>    name         = optional(string)<br/>    multi_runner = optional(any)<br/>    runners      = optional(any)<br/>    queues       = optional(any)<br/>    labels       = optional(map(string), {})<br/>  }))</pre> | `[]` | no |
 | schedule\_enabled | Set false to pause sampling without destroying anything. | `bool` | `true` | no |
 | schedule\_expression | How often to sample. One minute is the finest EventBridge allows and the recommended rate. | `string` | `"rate(1 minute)"` | no |
 | secrets\_kms\_key\_arns | Other customer-managed keys that encrypt secrets or parameters this module reads (an existing GitHub App secret, a remote-write credential, the runner module's SSM parameters). | `list(string)` | `[]` | no |
@@ -308,5 +330,5 @@ No modules.
 | lambda\_role\_arn | The function's role. Trust it from a remote-write writer role in another account (remote\_write.auth.sigv4.role\_arn); see the README. |
 | lambda\_role\_name | The function's role name, for attaching more permissions. |
 | log\_group\_name | Where the function logs: one JSON line per sample, plus a line per failed source. |
-| runner\_configs | The runner configs as the module derived them (environment, cap, queues, GitHub API). Check this first when a series looks wrong. |
+| runner\_configs | The runner configs as the module derived them (environment, cap, main and dead-letter queue, GitHub API). Check this first when a series looks wrong. |
 <!-- END_TF_DOCS -->

@@ -12,7 +12,15 @@ A runner stack built with `modules/multi-runner` of terraform-aws-github-runner 
 - GitHub is read through a dedicated read-only App, whose credentials go in the secret the module
   creates (`github_app_secret_name` output; see the main README). Only `github_owners` are queried.
 
+The runner module hashes its own Lambda zips when it plans, so download them first, into
+`runner_lambda_zips_dir` (its `examples/lambdas-download` does the same):
+
 ```sh
+mkdir -p lambdas
+for name in webhook runners runner-binaries-syncer; do
+  curl -fL -o "lambdas/${name}.zip" \
+    "https://github.com/github-aws-runners/terraform-aws-github-runner/releases/download/v7.11.0/${name}.zip"
+done
 terraform init
 terraform apply
 terraform output runner_configs   # what the module read from the stack
