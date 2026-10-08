@@ -53,6 +53,8 @@ const MODULE_LIMITS: readonly [string, { min: number; max: number }][] = [
   ['length(var.remote_write.auth.sigv4.external_id)', LIMITS.externalIdLength],
 ]
 
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
 const moduleList = (pattern: RegExp, what: string): string[] => {
   const list = terraform.match(pattern)?.[1]
   assert.ok(list, `${what} not found in the Terraform module`)
@@ -81,9 +83,10 @@ describe('the Terraform module and the Lambda', () => {
 
   it('bound the same values the same way', () => {
     for (const [subject, { min, max }] of MODULE_LIMITS) {
-      for (const bound of [`${subject} >= ${min}`, `${subject} <= ${max}`]) {
-        assert.ok(terraform.includes(bound), `the module has no "${bound}"`)
-      }
+      // Every bound the module puts on it, so a second copy or a changed digit shows.
+      const written = new RegExp(`${escapeRegExp(subject)} (>=|<=) ([0-9]+)`, 'g')
+      const bounds = new Set([...terraform.matchAll(written)].map(([, op, n]) => `${op} ${n}`))
+      assert.deepEqual([...bounds].sort(), [`<= ${max}`, `>= ${min}`].sort(), subject)
     }
   })
 

@@ -44,8 +44,10 @@ The Lambda code, the Terraform modules, and the release pipeline that builds and
   attestation as a trust anchor and verifies the zip again on every plan. The pinned SHA-256 is the
   stronger anchor: the attestation names the tag, so it relies on the repository's tag ruleset as
   well. Drafts, which anyone with write access can edit, are not trusted: every draft for the tag
-  is deleted, and the release published is the one the run created, by its id, after its assets'
-  digests are checked against the build's.
+  is deleted, and the release published is the one the run created, by its id, after its tag and
+  its assets' digests are checked against the build's. A release already published for the tag
+  must hold that same build, or the run fails; turn on immutable releases (CONTRIBUTING.md) so
+  none can change once published.
 - The S3 deployment path requires the object version, so the deployed code is the object that was
   verified. The module's own code, `download.sh` included, comes from the module source's `?ref=`;
   pin it to a commit to rely on nothing else.
