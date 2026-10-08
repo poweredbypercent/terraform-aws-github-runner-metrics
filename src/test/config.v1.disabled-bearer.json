@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "runner_configs": [
+    {
+      "name": "ci",
+      "environment": "ci",
+      "max_runners": 0,
+      "runner_name_prefix": "ci-",
+      "github_api_url": "https://api.github.com",
+      "queues": {
+        "main": "arn:aws:sqs:eu-west-1:123456789012:ci-queued-builds",
+        "dead_letter": "arn:aws:sqs:eu-west-1:123456789012:ci-queued-builds_dead_letter"
+      },
+      "labels": {}
+    }
+  ],
+  "github": {
+    "credentials": { "type": "none" },
+    "owners": []
+  },
+  "remote_write": {
+    "url": "https://mimir.example:8443/api/v1/push",
+    "auth": {
+      "type": "bearer",
+      "secret_arn": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:mimir-AbCdEf"
+    },
+    "headers": {},
+    "timeout_seconds": 20
+  },
+  "labels": {},
+  "boot_grace_seconds": 60,
+  "source_timeout_seconds": 15
+}

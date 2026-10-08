@@ -1,0 +1,20 @@
+# Dependencies and build output. dist/ is built and attested by the release workflow and is
+# never committed: consumers take the release zip, not the source tree.
+node_modules/
+dist/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+modules/download-lambda/.build/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+
+# Written by CI to pin the AWS provider major for a matrix leg.
+ci_aws_provider_override.tf

@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "runner_configs": [
+    {
+      "name": "ci",
+      "environment": "ci",
+      "max_runners": -1,
+      "runner_name_prefix": "",
+      "github_api_url": "https://api.github.com",
+      "queues": {
+        "main": "arn:aws:sqs:eu-west-1:123456789012:ci-builds",
+        "dead_letter": null
+      },
+      "labels": {}
+    }
+  ],
+  "github": {
+    "credentials": {
+      "type": "ssm",
+      "app_id_parameter": "/gh/app-id",
+      "private_key_parameter": "/gh/app-key"
+    },
+    "owners": ["acme/infra"]
+  },
+  "remote_write": {
+    "url": "https://prometheus-prod-01-eu-west-0.grafana.net/api/prom/push",
+    "auth": {
+      "type": "basic",
+      "secret_arn": "arn:aws:secretsmanager:eu-west-1:123456789012:secret:grafana-AbCdEf"
+    },
+    "headers": {},
+    "timeout_seconds": 10
+  },
+  "labels": {},
+  "boot_grace_seconds": 30,
+  "source_timeout_seconds": 10
+}
