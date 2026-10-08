@@ -1,4 +1,3 @@
-import type { Instance } from '@aws-sdk/client-ec2'
 import { scopeFromTags } from '../domain/scope.ts'
 import { readEach } from '../domain/settle.ts'
 import type {
@@ -28,10 +27,21 @@ export type GetQueueAgeDatapoints = (
   signal: AbortSignal,
 ) => Promise<ReadonlyMap<string, readonly number[]>>
 
+/** A pending or running EC2 instance: what the runner logic reads of one, in plain terms. */
+export interface Ec2Instance {
+  readonly id: string
+  readonly type: string | undefined
+  /** EC2 sets it only for spot (and scheduled) instances; absent is on-demand. */
+  readonly lifecycle: string | undefined
+  readonly state: string | undefined
+  readonly launchTime: Date | undefined
+  readonly tags: Readonly<Record<string, string>>
+}
+
 export type DescribeRunnerInstances = (
   environments: readonly string[],
   signal: AbortSignal,
-) => Promise<readonly Instance[]>
+) => Promise<readonly Ec2Instance[]>
 
 const allQueues = (configs: readonly RunnerConfig[]): QueueRef[] => configs.flatMap(c => c.queues)
 
@@ -79,9 +89,9 @@ const AGE_LOOKBACK_MS = 5 * 60_000
 
 /**
  * The oldest message's age per queue, from CloudWatch: SQS publishes it each minute, about a
- * minute behind. No datapoint means the queue has been idle (SQS stops publishing for idle
- * queues), which is an age of zero. A queue SQS says is empty is zero whatever CloudWatch's last
- * datapoint says; the model applies that, since it needs both sources.
+ * minute behind. A queue without a datapoint is left out: an idle queue (SQS stops publishing for
+ * those), a queue that does not exist and one not published yet all look the same here. The model
+ * tells them apart with what SQS said in the same sample.
  */
 export async function readQueueAges(
   getDatapoints: GetQueueAgeDatapoints,
@@ -95,11 +105,13 @@ export async function readQueueAges(
     { start: new Date(now - AGE_LOOKBACK_MS), end: new Date(now) },
     signal,
   )
-  return new Map(queues.map(q => [q.arn, datapoints.get(q.name)?.[0] ?? 0]))
+  const ages = new Map<string, number>()
+  for (const queue of queues) {
+    const newest = datapoints.get(queue.name)?.[0]
+    if (newest !== undefined) ages.set(queue.arn, newest)
+  }
+  return ages
 }
-
-const tag = (instance: Instance, key: string): string | undefined =>
-  instance.Tags?.find(t => t.Key === key)?.Value
 
 /** The runner instances of the configured environments, in the domain's terms. */
 export async function readInstances(
@@ -114,19 +126,18 @@ export async function readInstances(
   )
   const instances: RunnerInstance[] = []
   for (const i of raw) {
-    const environment = tag(i, 'ghr:environment')
+    const environment = i.tags['ghr:environment']
     const apiUrl = environment ? apiUrlOf.get(environment) : undefined
-    if (!i.InstanceId || !environment || apiUrl === undefined) continue
+    if (!environment || apiUrl === undefined) continue
     instances.push({
-      id: i.InstanceId,
+      id: i.id,
       environment,
-      instanceType: i.InstanceType ?? 'unknown',
-      // EC2 sets InstanceLifecycle only for spot (and scheduled) instances; absent is on-demand.
-      lifecycle: i.InstanceLifecycle === 'spot' ? 'spot' : 'on-demand',
-      state: i.State?.Name ?? 'unknown',
-      launchTime: i.LaunchTime?.getTime(),
-      orphan: tag(i, 'ghr:orphan') === 'true',
-      scope: scopeFromTags(tag(i, 'ghr:Type'), tag(i, 'ghr:Owner'), apiUrl),
+      instanceType: i.type ?? 'unknown',
+      lifecycle: i.lifecycle === 'spot' ? 'spot' : 'on-demand',
+      state: i.state ?? 'unknown',
+      launchTime: i.launchTime?.getTime(),
+      orphan: i.tags['ghr:orphan'] === 'true',
+      scope: scopeFromTags(i.tags['ghr:Type'], i.tags['ghr:Owner'], apiUrl),
     })
   }
   return instances

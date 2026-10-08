@@ -22,13 +22,9 @@ describe('catalogue', () => {
     )
   })
 
-  it('reserves exactly the labels the metrics set, here and in the Terraform module', () => {
+  it('reserves exactly the labels the metrics set (the module the same: parity.test.ts)', () => {
     const used = [...new Set(ALL_METRICS.flatMap(m => m.labels))].sort()
     assert.deepEqual([...BUILT_IN_LABELS].sort(), used)
-    const config = readFileSync(new URL('../../config.tf', import.meta.url), 'utf8')
-    const reserved = config.match(/built_in_labels = (\[[^\]]*\])/)?.[1]
-    assert.ok(reserved, 'config.tf: local.built_in_labels not found')
-    assert.deepEqual((JSON.parse(reserved) as string[]).sort(), used)
   })
 
   it('keeps docs/metrics.md in step with the catalogue', () => {

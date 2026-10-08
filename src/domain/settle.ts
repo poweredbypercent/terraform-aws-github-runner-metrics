@@ -36,7 +36,11 @@ export async function settle<T>(
  * (a credential provider), so they cannot outrun the budget they are part of.
  */
 export function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(signal.reason)
+  if (signal.aborted) {
+    // Nothing waits for `work` now; its failure must not become an unhandled rejection.
+    work.catch(() => {})
+    return Promise.reject(signal.reason)
+  }
   return new Promise<T>((resolve, reject) => {
     const abort = () => reject(signal.reason)
     signal.addEventListener('abort', abort, { once: true })

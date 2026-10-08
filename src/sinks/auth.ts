@@ -61,31 +61,51 @@ export type CredentialProvider = () => Promise<AwsCredentialIdentity>
 
 /** Credentials are refreshed this long before they expire. */
 const CREDENTIAL_REFRESH_MARGIN_MS = 5 * 60_000
+/** A refresh still pending after this long is given up on; the next caller starts another. */
+const CREDENTIAL_REFRESH_GIVE_UP_MS = 30_000
 
 /**
  * A provider that keeps its credentials until shortly before they expire. The SDK's assume-role
  * provider does not cache by itself (its clients do, around it), and called straight from the
- * signer it would call STS on every push. Concurrent callers share one refresh.
+ * signer it would call STS on every push. Concurrent callers share one refresh, but not forever:
+ * one that hangs is replaced, so a single stuck STS call cannot fail every later push. When a
+ * refresh fails, credentials that have not expired yet keep signing until the next attempt.
  */
 export function refreshingCredentials(
   provider: CredentialProvider,
   now: () => number = Date.now,
 ): CredentialProvider {
   let current: AwsCredentialIdentity | undefined
-  let refreshing: Promise<AwsCredentialIdentity> | undefined
-  const fresh = (c: AwsCredentialIdentity) =>
-    c.expiration === undefined || c.expiration.getTime() - now() > CREDENTIAL_REFRESH_MARGIN_MS
+  let refresh:
+    | { readonly started: number; readonly done: Promise<AwsCredentialIdentity> }
+    | undefined
+  const remainingMs = (c: AwsCredentialIdentity) =>
+    c.expiration === undefined ? Number.POSITIVE_INFINITY : c.expiration.getTime() - now()
+  const startRefresh = () => {
+    const attempt = {
+      started: now(),
+      done: provider()
+        .then(
+          credentials => {
+            current = credentials
+            return credentials
+          },
+          error => {
+            if (current && remainingMs(current) > 0) return current
+            throw error
+          },
+        )
+        .finally(() => {
+          if (refresh === attempt) refresh = undefined
+        }),
+    }
+    return attempt
+  }
   return async () => {
-    if (current && fresh(current)) return current
-    refreshing ??= provider()
-      .then(credentials => {
-        current = credentials
-        return credentials
-      })
-      .finally(() => {
-        refreshing = undefined
-      })
-    return refreshing
+    if (current && remainingMs(current) > CREDENTIAL_REFRESH_MARGIN_MS) return current
+    if (!refresh || now() - refresh.started > CREDENTIAL_REFRESH_GIVE_UP_MS)
+      refresh = startRefresh()
+    return refresh.done
   }
 }
 

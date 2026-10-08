@@ -53,8 +53,7 @@ export function buildSeries(config: SeriesSettings, snapshot: Snapshot): Sample[
 
   if (snapshot.ages) {
     for (const { c, queue } of queuesOf(config)) {
-      const reported = snapshot.ages.get(queue.arn)
-      const age = reported === undefined ? undefined : ageOf(queue, reported, snapshot.depths)
+      const age = ageOf(queue, snapshot.ages, snapshot.depths)
       if (age === undefined) continue
       series.push(sample(METRICS.queueAge, { ...baseLabels(c), queue: queue.kind }, age, now))
     }
@@ -86,17 +85,21 @@ const queuesOf = (config: SeriesSettings) =>
   config.runnerConfigs.flatMap(c => c.queues.map(queue => ({ c, queue })))
 
 /**
- * CloudWatch's age of the oldest message, checked against what SQS said in the same sample. A
- * queue SQS found empty has no oldest message, whatever CloudWatch last published: SQS stops
- * publishing once a queue drains, so its last datapoint would linger. A queue SQS says does not
- * exist has no age at all (CloudWatch has no datapoints for it either, which reads as zero). A
- * queue SQS could not read keeps CloudWatch's answer.
+ * The oldest message's age: CloudWatch's datapoint, checked against what SQS said in the same
+ * sample. A queue SQS found empty has no oldest message, whatever CloudWatch last published (its
+ * last datapoint outlives the messages it measured). A queue SQS says does not exist has no age.
+ * Otherwise the age is CloudWatch's datapoint, and without one it is unknown, never zero: a main
+ * queue that is missing, or messages CloudWatch has not published yet.
  */
-function ageOf(queue: QueueRef, reported: number, depths: Snapshot['depths']): number | undefined {
-  if (!depths) return reported
-  const depth = depths.values.get(queue.arn)
-  if (depth) return depth.visible + depth.inFlight + depth.delayed === 0 ? 0 : reported
-  return depths.failed.some(f => f.key === queue.arn) ? reported : undefined
+function ageOf(
+  queue: QueueRef,
+  ages: ReadonlyMap<string, number>,
+  depths: Snapshot['depths'],
+): number | undefined {
+  const depth = depths?.values.get(queue.arn)
+  if (depth && depth.visible + depth.inFlight + depth.delayed === 0) return 0
+  if (depths && !depth && !depths.failed.some(f => f.key === queue.arn)) return undefined
+  return ages.get(queue.arn)
 }
 
 function instanceSeries(

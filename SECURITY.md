@@ -20,8 +20,9 @@ The Lambda code, the Terraform modules, and the release pipeline that builds and
 - The function's IAM policy is generated from the features in use; read-only except for writing its
   own logs and, when configured, assuming a Prometheus writer role. It names exactly the queues,
   secrets, parameters, keys and role in the configuration, and the module refuses wildcards in
-  any of them. The EC2 and CloudWatch reads, which take no resource, are limited to the module's
-  region.
+  any of them, including the queues and parameters it reads from a runner stack's outputs, before
+  the policy is written. The EC2 and CloudWatch reads, which take no resource, are limited to the
+  module's region.
 - The organisations and repositories queried come from runner instance tags, which a job may be
   able to set on its own instance: they are validated and encoded before use, and only those in
   the required `owners` allowlist are queried.
@@ -35,7 +36,8 @@ The Lambda code, the Terraform modules, and the release pipeline that builds and
 - Releases are built in CI from a tagged commit on `main` and are reproducible. Once a reviewer
   approves the protected `release` environment, the published zip is checked against the hash the
   build computed, attested, and published with its SHA-256 (see the README for the full
-  `gh attestation verify` command). `modules/download-lambda` requires one of them as a trust
+  `gh attestation verify` command). A draft left by an earlier run is replaced, never adopted, so a
+  release holds only what that run built. `modules/download-lambda` requires one of them as a trust
   anchor and verifies the zip again on every plan. The pinned SHA-256 is the stronger anchor: the
   attestation names the tag, so it relies on the repository's tag ruleset as well.
 - The S3 deployment path requires the object version, so the deployed code is the object that was

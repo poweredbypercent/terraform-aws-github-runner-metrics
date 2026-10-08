@@ -17,7 +17,12 @@ import {
   type GetQueueAttributesCommandOutput,
 } from '@aws-sdk/client-sqs'
 import { GetParameterCommand, type GetParameterCommandOutput } from '@aws-sdk/client-ssm'
-import type { DescribeRunnerInstances, GetQueueAgeDatapoints, GetQueueAttributes } from './aws.ts'
+import type {
+  DescribeRunnerInstances,
+  Ec2Instance,
+  GetQueueAgeDatapoints,
+  GetQueueAttributes,
+} from './aws.ts'
 
 /**
  * The AWS SDK calls behind the source ports: the paging, batching and error meanings of each API,
@@ -117,10 +122,23 @@ export const cloudWatchQueueAges =
     return datapoints
   }
 
+const toEc2Instance = (i: Instance & { InstanceId: string }): Ec2Instance => ({
+  id: i.InstanceId,
+  type: i.InstanceType,
+  lifecycle: i.InstanceLifecycle,
+  state: i.State?.Name,
+  launchTime: i.LaunchTime,
+  tags: Object.fromEntries(
+    (i.Tags ?? []).flatMap(t =>
+      t.Key === undefined || t.Value === undefined ? [] : [[t.Key, t.Value]],
+    ),
+  ),
+})
+
 export const ec2RunnerInstances =
   (ec2: Send<DescribeInstancesCommand, DescribeInstancesCommandOutput>): DescribeRunnerInstances =>
   async (environments, abortSignal) => {
-    const instances: Instance[] = []
+    const instances: Ec2Instance[] = []
     let NextToken: string | undefined
     do {
       const page = await ec2.send(
@@ -135,7 +153,10 @@ export const ec2RunnerInstances =
         { abortSignal },
       )
       for (const reservation of page.Reservations ?? []) {
-        instances.push(...(reservation.Instances ?? []))
+        for (const instance of reservation.Instances ?? []) {
+          if (instance.InstanceId !== undefined)
+            instances.push(toEc2Instance({ ...instance, InstanceId: instance.InstanceId }))
+        }
       }
       NextToken = page.NextToken
     } while (NextToken)

@@ -149,6 +149,40 @@ describe('buildSeries', () => {
     assert.deepEqual(age({ runner_config: 'gpu' }, series), [45])
   })
 
+  it('reports no age it does not know, rather than zero', () => {
+    const age = (labels: Record<string, string>, series: readonly Sample[]) =>
+      find(series, 'scale_up_queue_oldest_message_age_seconds', labels).map(s => s.value)
+    const series = buildSeries(
+      config,
+      snapshot({
+        depths: {
+          // Messages waiting on linux that CloudWatch has not published yet; gpu's main queue
+          // was deleted, so SQS failed it and CloudWatch has nothing for it.
+          values: new Map([
+            [ARN('ci-linux-queued-builds'), { visible: 2, inFlight: 0, delayed: 0 }],
+          ]),
+          failed: [
+            {
+              key: ARN('ci-gpu-queued-builds'),
+              error: 'queue ci-gpu-queued-builds does not exist',
+            },
+          ],
+        },
+        ages: new Map(),
+      }),
+    )
+    assert.deepEqual(age({ runner_config: 'linux' }, series), [])
+    assert.deepEqual(age({ runner_config: 'gpu' }, series), [])
+
+    // With SQS down altogether, CloudWatch's datapoint is all there is, and no datapoint is unknown.
+    const unread = buildSeries(
+      config,
+      snapshot({ ages: new Map([[ARN('ci-gpu-queued-builds'), 45]]) }),
+    )
+    assert.deepEqual(age({ runner_config: 'gpu' }, unread), [45])
+    assert.deepEqual(age({ runner_config: 'linux' }, unread), [])
+  })
+
   it('counts live instances by type, lifecycle and state, and orphans apart', () => {
     const series = buildSeries(
       config,

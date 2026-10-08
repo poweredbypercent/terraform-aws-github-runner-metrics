@@ -1,9 +1,8 @@
 # What the role may read, generated from the inputs: a statement exists only when its feature is
-# used, and names exactly the queues, secrets, parameters and keys in the configuration.
+# used, and names exactly the queues, secrets, parameters and keys in the configuration. None may
+# be a wildcard: the secrets, keys and role are validated as variables, and the queues and
+# parameters, which a runner stack can supply, by the preconditions on the policy document.
 locals {
-  queue_arns = distinct(compact(flatten([
-    for c in values(local.runner_configs) : [c.queues.main, c.queues.dead_letter]
-  ])))
   secret_arns = compact([local.github_secret_arn, local.remote_write_secret_arn])
   ssm_parameter_arns = local.github_ssm_parameters == null ? [] : [
     for name in compact(values(local.github_ssm_parameters)) :
@@ -34,14 +33,25 @@ resource "aws_iam_role" "lambda" {
 }
 
 data "aws_iam_policy_document" "lambda" {
+  lifecycle {
+    precondition {
+      condition     = length(local.rejected.queue_arns) == 0
+      error_message = "Queues must be SQS queue ARNs, without wildcards (a derived name is <environment>-queued-builds_dead_letter, at most 80 characters): ${join(", ", local.rejected.queue_arns)}."
+    }
+    precondition {
+      condition     = length(local.rejected.ssm_parameter_names) == 0
+      error_message = "The GitHub App's SSM parameters must be parameter names, without wildcards: ${join(", ", local.rejected.ssm_parameter_names)}."
+    }
+  }
+
   statement {
     sid       = "AllowWriteLogs"
     actions   = ["logs:CreateLogStream", "logs:PutLogEvents"]
     resources = ["${aws_cloudwatch_log_group.lambda.arn}:*"]
   }
 
-  # An empty resource list is an invalid policy; a precondition (main.tf) reports the missing
-  # runner configs.
+  # An empty resource list is an invalid policy; a precondition on the function (main.tf) reports
+  # the missing runner configs.
   dynamic "statement" {
     for_each = length(local.queue_arns) > 0 ? [1] : []
     content {

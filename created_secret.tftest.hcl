@@ -8,7 +8,7 @@ mock_provider "aws" {
   }
   override_data {
     target = data.aws_region.current
-    values = { id = "eu-west-1" }
+    values = { endpoint = "ec2.eu-west-1.amazonaws.com" }
   }
   override_data {
     target = data.aws_partition.current

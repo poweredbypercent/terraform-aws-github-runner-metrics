@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import type { Instance } from '@aws-sdk/client-ec2'
 import { queueArn as ARN, queuesOf, signal, testConfig } from '../test/fixtures.ts'
-import { readInstances, readQueueAges, readQueueDepths } from './aws.ts'
+import { type Ec2Instance, readInstances, readQueueAges, readQueueDepths } from './aws.ts'
 
 const { runnerConfigs } = testConfig({
   runner_configs: [
@@ -87,7 +86,7 @@ describe('readQueueDepths', () => {
 })
 
 describe('readQueueAges', () => {
-  it('takes the newest datapoint, and reads no datapoint as an idle queue', async () => {
+  it('takes the newest datapoint, and leaves out a queue without one', async () => {
     let asked: readonly string[] = []
     const ages = await readQueueAges(
       async names => {
@@ -104,13 +103,20 @@ describe('readQueueAges', () => {
       'ci-ghes-queued-builds',
     ])
     assert.equal(ages.get(ARN('ci-linux-queued-builds')), 140)
-    assert.equal(ages.get(ARN('ci-ghes-queued-builds')), 0)
+    assert.deepEqual([...ages.keys()], [ARN('ci-linux-queued-builds')])
   })
 })
 
 describe('readInstances', () => {
-  const tags = (pairs: Record<string, string>) =>
-    Object.entries(pairs).map(([Key, Value]) => ({ Key, Value }))
+  const instance = (id: string, fields: Partial<Ec2Instance>): Ec2Instance => ({
+    id,
+    type: undefined,
+    lifecycle: undefined,
+    state: undefined,
+    launchTime: undefined,
+    tags: {},
+    ...fields,
+  })
 
   it('maps runner instances, their purchase option and their GitHub scope', async () => {
     let environments: readonly string[] = []
@@ -118,27 +124,25 @@ describe('readInstances', () => {
       async envs => {
         environments = envs
         return [
-          {
-            InstanceId: 'i-0aaaaaaaa',
-            InstanceType: 'c7g.xlarge',
-            InstanceLifecycle: 'spot',
-            State: { Name: 'running' },
-            LaunchTime: new Date(1000),
-            Tags: tags({ 'ghr:environment': 'ci-linux', 'ghr:Type': 'Org', 'ghr:Owner': 'acme' }),
-          },
-          {
-            InstanceId: 'i-0bbbbbbbb',
-            InstanceType: 'm7i.large',
-            State: { Name: 'pending' },
-            Tags: tags({
+          instance('i-0aaaaaaaa', {
+            type: 'c7g.xlarge',
+            lifecycle: 'spot',
+            state: 'running',
+            launchTime: new Date(1000),
+            tags: { 'ghr:environment': 'ci-linux', 'ghr:Type': 'Org', 'ghr:Owner': 'acme' },
+          }),
+          instance('i-0bbbbbbbb', {
+            type: 'm7i.large',
+            state: 'pending',
+            tags: {
               'ghr:environment': 'ci-ghes',
               'ghr:Type': 'Repo',
               'ghr:Owner': 'acme/widgets',
               'ghr:orphan': 'true',
-            }),
-          },
-          { InstanceId: 'i-0cccccccc', Tags: tags({ 'ghr:environment': 'another-stack' }) },
-        ] satisfies Instance[]
+            },
+          }),
+          instance('i-0cccccccc', { tags: { 'ghr:environment': 'another-stack' } }),
+        ]
       },
       runnerConfigs,
       signal,

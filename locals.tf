@@ -3,9 +3,10 @@ data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
 locals {
-  # The region's id is its name on aws 5.x and 6.x alike. 6.x deprecates it (and `name`) in favour
-  # of `region`, which 5.x does not have; switch to `region` once 5.x support is dropped.
-  region     = data.aws_region.current.id
+  # Read from the region's EC2 endpoint, ec2.<region>.<dns suffix>: the one attribute that neither
+  # aws 5.x nor 6.x deprecates. 6.x deprecates `id` and `name` for `region`, which 5.x does not
+  # have; use `region` once 5.x support is dropped.
+  region     = regex("^ec2\\.([a-z0-9-]+)\\.", data.aws_region.current.endpoint)[0]
   account    = data.aws_caller_identity.current.account_id
   partition  = data.aws_partition.current.partition
   dns_suffix = data.aws_partition.current.dns_suffix

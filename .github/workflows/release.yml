@@ -117,12 +117,13 @@ jobs:
           prerelease=""
           [[ "${TAG}" == *-* ]] && prerelease="--prerelease"
           # Draft first and publish once every asset is attached, so the release is complete the
-          # moment it appears (and works with immutable releases). A re-run finishes a draft an
-          # earlier run left, and leaves a published release alone: it can no longer change.
+          # moment it appears (and works with immutable releases). A published release is left
+          # alone: it can no longer change. A draft is replaced, not adopted: anyone who can write
+          # to the repository can edit a draft, so only what this run built is published.
           draft="$(gh release view "${TAG}" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
           case "${draft}" in
             false) echo "${TAG} is already published"; exit 0 ;;
-            true) gh release upload "${TAG}" assets/* --clobber ;;
-            *) gh release create "${TAG}" --draft --verify-tag --title "${TAG}" --notes-file notes.md ${prerelease} assets/* ;;
+            true) gh release delete "${TAG}" --yes ;;
           esac
+          gh release create "${TAG}" --draft --verify-tag --title "${TAG}" --notes-file notes.md ${prerelease} assets/*
           gh release edit "${TAG}" --draft=false

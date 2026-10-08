@@ -1,13 +1,15 @@
 # Problems that degrade the samples without stopping them. They warn rather than block; what would
-# stop every sample is a precondition on the function instead (main.tf).
+# stop every sample is refused instead (validation.tf).
 
-check "runner_configs" {
+check "queue_region" {
   assert {
     # The Lambda's SQS and CloudWatch clients are in its own region.
     condition     = alltrue([for arn in local.queue_arns : try(split(":", arn)[3], "") == local.region])
     error_message = "Every queue must be in the region this module is deployed in; deploy one instance of the module per region."
   }
+}
 
+check "runner_module" {
   assert {
     # The runner module sets both on every scale-up Lambda; without them capacity is not reported
     # and runners cannot be placed by their name prefix. A runner module this module does not know?

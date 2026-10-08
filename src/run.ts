@@ -1,9 +1,8 @@
-import type { Config } from './config/types.ts'
 import { err, type Result } from './domain/result.ts'
 import { settle } from './domain/settle.ts'
 import type { RunnerInstance, Snapshot, SourceHealth, SourceName } from './domain/types.ts'
 import { METRICS, type Sample, sample } from './model/catalogue.ts'
-import { buildSeries } from './model/series.ts'
+import { buildSeries, type SeriesSettings } from './model/series.ts'
 import type { VanishTracker } from './model/vanish.ts'
 import type { GitHubSource, Logger, RegisteredRunners, Sink, Sources } from './ports.ts'
 
@@ -16,8 +15,15 @@ import type { GitHubSource, Logger, RegisteredRunners, Sink, Sources } from './p
  * itself is the one failure that fails the invocation.
  */
 
+/** What a sample needs of the configuration; the credentials and the endpoint are the sink's. */
+export interface RunSettings extends SeriesSettings {
+  /** Constant labels for every series. */
+  readonly labels: Readonly<Record<string, string>>
+  readonly sourceTimeoutMs: number
+}
+
 export interface Deps {
-  readonly config: Config
+  readonly config: RunSettings
   readonly sources: Sources
   readonly sink: Sink
   readonly vanish: VanishTracker
@@ -114,7 +120,7 @@ async function readGitHub(
 
 /** The sampler's own series, and the global constant labels on every series. */
 function finalise(
-  labels: Config['labels'],
+  labels: RunSettings['labels'],
   samples: readonly Sample[],
   up: SourceHealth,
   now: number,

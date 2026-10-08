@@ -4,8 +4,8 @@ Issues and pull requests are welcome.
 
 ## Setting up
 
-- Node from `.nvmrc` (22; CI also runs 24), Terraform 1.11 or later for `terraform test` (1.7 runs
-  all but `created_secret.tftest.hcl`), Docker for the end-to-end test, and optionally tflint and
+- Node from `.nvmrc`, Terraform 1.11 or later for `terraform test` (1.7 runs all but
+  `created_secret.tftest.hcl`), Docker for the end-to-end test, and optionally tflint and
   terraform-docs.
 - `npm ci` installs the dependencies and the git hooks (lefthook).
 
@@ -18,11 +18,9 @@ terraform init -backend=false && terraform test
 terraform fmt -recursive
 ```
 
-CI runs them on Node 22 and 24. For Terraform: `terraform validate` on 1.5.7 and the latest,
-`terraform test` on 1.7.5 (the first with mock providers), 1.11 (plan-time overrides) and the
-latest, each against the AWS provider's 5.77 floor, the newest 5.x and the newest 6.x. The examples
-are validated and linted against the runner module versions they pin, and the workflows by
-actionlint and zizmor.
+CI runs them across the versions in the README's [compatibility table](README.md#compatibility),
+validates and lints the examples against the runner module versions they pin, and lints the
+workflows with actionlint and zizmor.
 
 ## Conventions
 
@@ -33,10 +31,16 @@ actionlint and zizmor.
   instance ids are never labels.
 - A source that fails leaves its series out; never report an unknown as zero.
 - The Terraform module hands the Lambda one JSON document, `CONFIG` (`config.tf`, read by
-  `src/config/parse.ts`). A change to it changes `src/test/config.v1.json` too: `main.tftest.hcl`
-  checks the module renders it and `src/config/contract.test.ts` that the Lambda reads it.
-- What would make the Lambda reject `CONFIG` is refused by the module first, as a variable
-  validation or a precondition on the function, never left to fail at runtime.
+  `src/config/parse.ts`). A change to it changes the `src/test/config.v1.*.json` documents too:
+  `main.tftest.hcl` checks the module renders each, and `src/config/contract.test.ts` what the
+  Lambda takes each to mean. Add a field with nothing for an older Lambda to misread; bump
+  `version` only for a change an older Lambda cannot read, since the module and the zip are
+  pinned separately.
+- What would make the Lambda reject `CONFIG` is refused by the module first, never left to fail at
+  runtime: as a variable's validation when the rule is about that variable alone, otherwise as an
+  entry of `local.rejected` (`validation.tf`) and a precondition on what it protects. The patterns
+  both sides use are in `src/config/patterns.ts`, and `src/config/parity.test.ts` fails when the
+  module's copy differs. Each refusal has a test that names the rule it expects.
 - Keep the Lambda's dependencies to the AWS SDK.
 
 ## Releasing

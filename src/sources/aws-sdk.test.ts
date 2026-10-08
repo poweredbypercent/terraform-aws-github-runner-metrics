@@ -115,10 +115,42 @@ describe('ec2RunnerInstances', () => {
     ])
     const instances = await ec2RunnerInstances(ec2.client)(['ci'], signal)
     assert.deepEqual(
-      instances.map(i => i.InstanceId),
+      instances.map(i => i.id),
       ['i-1', 'i-2', 'i-3'],
     )
     assert.deepEqual(ec2.inputs[0]?.Filters?.[1], { Name: 'tag:ghr:environment', Values: ['ci'] })
+  })
+
+  it("translates EC2's shape into plain fields, skipping what has no id", async () => {
+    const ec2 = fake<DescribeInstancesCommand, DescribeInstancesCommandOutput>([
+      {
+        Reservations: [
+          {
+            Instances: [
+              {
+                InstanceId: 'i-1',
+                InstanceType: 'c7g.large',
+                InstanceLifecycle: 'spot',
+                State: { Name: 'running' },
+                LaunchTime: new Date(1000),
+                Tags: [{ Key: 'ghr:environment', Value: 'ci' }, { Key: 'no-value' }],
+              },
+              { InstanceType: 'c7g.large' },
+            ],
+          },
+        ],
+      },
+    ])
+    assert.deepEqual(await ec2RunnerInstances(ec2.client)(['ci'], signal), [
+      {
+        id: 'i-1',
+        type: 'c7g.large',
+        lifecycle: 'spot',
+        state: 'running',
+        launchTime: new Date(1000),
+        tags: { 'ghr:environment': 'ci' },
+      },
+    ])
   })
 })
 

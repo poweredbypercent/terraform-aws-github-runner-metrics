@@ -1,26 +1,27 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { queuesOf } from '../test/fixtures.ts'
+import { queuesOf, renderedConfig } from '../test/fixtures.ts'
 import { ConfigError, parseConfig, queueFromArn } from './parse.ts'
 
-const minimal = {
-  version: 1,
-  runner_configs: [
-    {
-      name: 'linux',
-      environment: 'ci-linux',
-      max_runners: 64,
-      runner_name_prefix: 'linux',
-      queues: queuesOf('ci-linux-queued-builds', 'ci-linux-queued-builds_dead_letter'),
-    },
-  ],
-  remote_write: { url: 'http://localhost:9090/api/v1/write' },
+const linux = {
+  name: 'linux',
+  environment: 'ci-linux',
+  max_runners: 64,
+  runner_name_prefix: 'linux',
+  queues: queuesOf('ci-linux-queued-builds', 'ci-linux-queued-builds_dead_letter'),
 }
 
-const withRunnerConfig = (overrides: Record<string, unknown>) => ({
-  ...minimal,
-  runner_configs: [{ ...minimal.runner_configs[0], ...overrides }],
-})
+const withRunnerConfig = (overrides: Record<string, unknown>) =>
+  renderedConfig({ runner_configs: [{ ...linux, ...overrides }] })
+
+const SECRET_ARN = 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:remote-write-AbCdEf'
+const AMP = 'https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-1/api/v1/remote_write'
+const SIGV4 = {
+  type: 'sigv4',
+  region: 'eu-west-1',
+  service: 'aps',
+  session_name: 'github-runner-metrics-123456789012',
+}
 
 const problemsOf = (config: unknown): readonly string[] => {
   try {
@@ -43,14 +44,15 @@ const assertProblems = (config: unknown, expected: readonly RegExp[]) => {
 }
 
 describe('parseConfig', () => {
-  it('reads a minimal config with defaults', () => {
-    const config = parseConfig(JSON.stringify(minimal))
-    const [linux] = config.runnerConfigs
-    assert.equal(linux?.environment, 'ci-linux')
-    assert.equal(linux?.maxRunners, 64)
-    assert.equal(linux?.githubApiUrl, 'https://api.github.com')
+  it('reads the config the module renders', () => {
+    const config = parseConfig(JSON.stringify(withRunnerConfig({})))
+    const [first] = config.runnerConfigs
+    assert.equal(first?.environment, 'ci-linux')
+    assert.equal(first?.maxRunners, 64)
+    assert.equal(first?.runnerNamePrefix, 'linux')
+    assert.equal(first?.githubApiUrl, 'https://api.github.com')
     assert.deepEqual(
-      linux?.queues.map(q => [q.kind, q.name]),
+      first?.queues.map(q => [q.kind, q.name]),
       [
         ['main', 'ci-linux-queued-builds'],
         ['dead_letter', 'ci-linux-queued-builds_dead_letter'],
@@ -62,11 +64,25 @@ describe('parseConfig', () => {
     assert.equal(config.bootGraceSeconds, 30)
   })
 
-  it('treats -1 and null as an unlimited runner cap', () => {
-    for (const max_runners of [-1, null]) {
-      const config = parseConfig(JSON.stringify(withRunnerConfig({ max_runners })))
-      assert.equal(config.runnerConfigs[0]?.maxRunners, null)
-    }
+  it("requires every field the module renders: the defaults are the module's alone", () => {
+    assertProblems(
+      renderedConfig({
+        runner_configs: [{ ...linux, github_api_url: undefined, max_runners: undefined }],
+        remote_write: { timeout_seconds: undefined },
+        boot_grace_seconds: undefined,
+      }),
+      [
+        /github_api_url must be an http\(s\) URL/,
+        /max_runners must be a number/,
+        /remote_write\.timeout_seconds must be a number/,
+        /boot_grace_seconds must be a number/,
+      ],
+    )
+  })
+
+  it('treats -1 as an unlimited runner cap', () => {
+    const config = parseConfig(JSON.stringify(withRunnerConfig({ max_runners: -1 })))
+    assert.equal(config.runnerConfigs[0]?.maxRunners, null)
   })
 
   it('takes each queue kind from the config, whatever the queue is called', () => {
@@ -80,44 +96,42 @@ describe('parseConfig', () => {
         ['dead_letter', 'jobs-failed.fifo'],
       ],
     )
+    const mainOnly = parseConfig(JSON.stringify(withRunnerConfig({ queues: queuesOf('jobs') })))
+    assert.deepEqual(
+      mainOnly.runnerConfigs[0]?.queues.map(q => q.kind),
+      ['main'],
+    )
   })
 
-  it('requires one main queue and at most one dead-letter queue, of known kinds', () => {
-    assertProblems(withRunnerConfig({ queues: [] }), [/queues must have exactly one main queue/])
-    assertProblems(
-      withRunnerConfig({
-        queues: [...queuesOf('a', 'b'), ...queuesOf('c', 'd')],
-      }),
-      [/exactly one main queue/, /at most one dead_letter queue/],
-    )
-    assertProblems(withRunnerConfig({ queues: [{ arn: queuesOf('a')[0]?.arn, kind: 'retry' }] }), [
-      /queues\[0\]\.kind must be one of main, dead_letter/,
+  it('requires a main queue', () => {
+    assertProblems(withRunnerConfig({ queues: { dead_letter: null } }), [
+      /queues\.main must be a non-empty string/,
     ])
   })
 
   it('reads the GitHub and SigV4 options', () => {
     const config = parseConfig(
-      JSON.stringify({
-        ...minimal,
-        github: {
-          credentials: {
-            type: 'secret',
-            secret_arn:
-              'arn:aws:secretsmanager:eu-west-1:123456789012:secret:runner-metrics/github-app-AbCdEf',
+      JSON.stringify(
+        renderedConfig({
+          github: {
+            credentials: {
+              type: 'secret',
+              secret_arn:
+                'arn:aws:secretsmanager:eu-west-1:123456789012:secret:runner-metrics/github-app-AbCdEf',
+            },
+            owners: ['acme', 'acme/widgets'],
           },
-          owners: ['acme', 'acme/widgets'],
-        },
-        remote_write: {
-          url: 'https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-1/api/v1/remote_write',
-          auth: {
-            type: 'sigv4',
-            region: 'eu-west-1',
-            role_arn: 'arn:aws:iam::210987654321:role/writer',
+          remote_write: {
+            url: AMP,
+            auth: {
+              ...SIGV4,
+              role_arn: 'arn:aws:iam::210987654321:role/writer',
+              external_id: 'ci',
+            },
+            headers: { 'X-Scope-OrgID': 'ci' },
           },
-          headers: { 'X-Scope-OrgID': 'ci' },
-        },
-        labels: { cluster: 'ci' },
-      }),
+        }),
+      ),
     )
     assert.equal(config.github.credentials.type, 'secret')
     assert.deepEqual(config.github.owners, ['acme', 'acme/widgets'])
@@ -126,21 +140,68 @@ describe('parseConfig', () => {
       region: 'eu-west-1',
       service: 'aps',
       roleArn: 'arn:aws:iam::210987654321:role/writer',
-      externalId: undefined,
-      sessionName: 'github-runner-metrics',
+      externalId: 'ci',
+      sessionName: 'github-runner-metrics-123456789012',
     })
     assert.deepEqual(config.remoteWrite.headers, { 'X-Scope-OrgID': 'ci' })
   })
 
+  it('reads basic and bearer auth, and SSM credentials', () => {
+    for (const type of ['basic', 'bearer'] as const) {
+      const config = parseConfig(
+        JSON.stringify(
+          renderedConfig({ remote_write: { url: AMP, auth: { type, secret_arn: SECRET_ARN } } }),
+        ),
+      )
+      assert.deepEqual(config.remoteWrite.auth, { type, secretArn: SECRET_ARN })
+    }
+    const ssm = parseConfig(
+      JSON.stringify(
+        renderedConfig({
+          github: {
+            credentials: {
+              type: 'ssm',
+              app_id_parameter: '/gh/id',
+              private_key_parameter: '/gh/key',
+            },
+            owners: ['acme'],
+          },
+        }),
+      ),
+    )
+    assert.deepEqual(ssm.github.credentials, {
+      type: 'ssm',
+      appIdParameter: '/gh/id',
+      privateKeyParameter: '/gh/key',
+    })
+  })
+
+  it('refuses a SigV4 region, service or external id AWS would not accept', () => {
+    assertProblems(
+      renderedConfig({
+        remote_write: {
+          url: AMP,
+          auth: { ...SIGV4, region: 'EU_WEST_1', service: '', external_id: 'x' },
+        },
+      }),
+      [
+        /auth\.region must be a non-empty string matching/,
+        /auth\.service must be a non-empty string/,
+        /external_id needs role_arn/,
+        /external_id must be 2-1224 characters/,
+      ],
+    )
+  })
+
   it('reports every problem at once', () => {
     assertProblems(
-      {
+      renderedConfig({
         version: 2,
         runner_configs: [
           {
             name: 'a',
             environment: 'dup',
-            queues: [{ arn: 'not-an-arn', kind: 'main' }],
+            queues: { main: 'not-an-arn' },
             labels: { state: 'x', team: '' },
             runner_name_prefix: 7,
           },
@@ -148,14 +209,14 @@ describe('parseConfig', () => {
         ],
         remote_write: {
           url: 'ftp://nope',
-          auth: { type: 'sigv4', region: 'eu-west-1', external_id: 'x' },
+          auth: { ...SIGV4, external_id: 'xy' },
           headers: { Authorization: 'Bearer secret' },
         },
         labels: { __hidden: 'x', 'bad-name': 'y' },
-      },
+      }),
       [
         /version must be 1/,
-        /queues\[0\]: not-an-arn is not an SQS queue ARN/,
+        /queues\.main: not-an-arn is not an SQS queue ARN/,
         /labels\.state is a built-in label/,
         /labels\.team must be a non-empty string/,
         /runner_name_prefix must be a string/,
@@ -170,73 +231,69 @@ describe('parseConfig', () => {
   })
 
   it('keeps credentials off plain http and out of URLs', () => {
-    const secretArn = 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:remote-write-AbCdEf'
     assertProblems(
-      {
-        ...withRunnerConfig({ github_api_url: 'http://ghe.example/api/v3' }),
+      renderedConfig({
+        runner_configs: [{ ...linux, github_api_url: 'http://ghe.example/api/v3' }],
         remote_write: {
-          url: 'http://u:p@prom.example/write?x=1',
-          auth: { type: 'bearer', secret_arn: secretArn },
+          url: 'http://prom.example/write',
+          auth: { type: 'bearer', secret_arn: SECRET_ARN },
         },
-      },
-      [
-        /github_api_url must use https/,
-        /remote_write\.url must use https/,
-        /remote_write\.url must not contain credentials/,
-        /remote_write\.url must not contain a query string/,
-      ],
+      }),
+      [/github_api_url must use https/, /remote_write\.url must use https/],
     )
+    for (const url of [
+      'https://u:p@prom.example/write',
+      'https://prom.example/write?token=x',
+      'https://prom.example/write#x',
+    ]) {
+      assertProblems(renderedConfig({ remote_write: { url } }), [
+        /remote_write\.url must be an http\(s\) URL without credentials, a query string or a fragment/,
+      ])
+    }
   })
 
   it('keeps credentials out of plain headers, and control characters out of their values', () => {
     for (const name of ['X-Api-Key', 'X-Auth-Token', 'Api-Secret']) {
-      assertProblems(
-        { ...minimal, remote_write: { url: minimal.remote_write.url, headers: { [name]: 'v' } } },
-        [new RegExp(`${name} looks like a credential`)],
-      )
+      assertProblems(renderedConfig({ remote_write: { headers: { [name]: 'v' } } }), [
+        new RegExp(`${name} looks like a credential`),
+      ])
     }
-    assertProblems(
-      {
-        ...minimal,
-        remote_write: { url: minimal.remote_write.url, headers: { 'X-Scope-OrgID': 'a\r\nb' } },
-      },
-      [/headers\.X-Scope-OrgID must be a non-empty string matching/],
-    )
+    assertProblems(renderedConfig({ remote_write: { headers: { 'X-Scope-OrgID': 'a\r\nb' } } }), [
+      /headers\.X-Scope-OrgID must be a non-empty string matching/,
+    ])
   })
 
   it('refuses a wildcard secret ARN', () => {
     assertProblems(
-      {
-        ...minimal,
+      renderedConfig({
         github: {
           credentials: {
             type: 'secret',
             secret_arn: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:*',
           },
+          owners: ['acme'],
         },
-      },
+      }),
       [/github\.credentials\.secret_arn/],
     )
   })
 
   it('requires an owners allowlist with GitHub credentials, and lower-cases it', () => {
-    const secretArn = 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-app-AbCdEf'
-    const credentials = { type: 'secret', secret_arn: secretArn }
-    assertProblems({ ...minimal, github: { credentials } }, [/github\.owners must list/])
+    const credentials = {
+      type: 'secret',
+      secret_arn: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-app-AbCdEf',
+    }
+    assertProblems(renderedConfig({ github: { credentials } }), [/github\.owners must list/])
     const config = parseConfig(
-      JSON.stringify({ ...minimal, github: { credentials, owners: ['Acme', 'Acme/Widgets'] } }),
+      JSON.stringify(renderedConfig({ github: { credentials, owners: ['Acme', 'Acme/Widgets'] } })),
     )
     assert.deepEqual(config.github.owners, ['acme', 'acme/widgets'])
   })
 
   it("keeps the signer's own headers for the signer", () => {
-    assertProblems(
-      {
-        ...minimal,
-        remote_write: { url: minimal.remote_write.url, headers: { 'X-Amz-Security-Token': 'x' } },
-      },
-      [/X-Amz-Security-Token is set by/],
-    )
+    assertProblems(renderedConfig({ remote_write: { headers: { 'X-Amz-Security-Token': 'x' } } }), [
+      /X-Amz-Security-Token is set by/,
+    ])
   })
 
   it('rejects a missing or unparseable CONFIG', () => {

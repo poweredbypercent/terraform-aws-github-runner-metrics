@@ -40,6 +40,26 @@ describe('untilAborted', () => {
     const aborted = AbortSignal.abort(new Error('gone'))
     await assert.rejects(untilAborted(Promise.resolve(1), aborted), /gone/)
   })
+
+  it('leaves no unhandled rejection behind when the work fails after it stopped waiting', async () => {
+    const unhandled: unknown[] = []
+    const record = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', record)
+    try {
+      for (const signal of [AbortSignal.abort(new Error('gone')), abortsAfter(10)]) {
+        let fail: (error: Error) => void = () => {}
+        const work = new Promise<never>((_, reject) => {
+          fail = reject
+        })
+        await assert.rejects(untilAborted(work, signal))
+        fail(new Error('sts down, too late'))
+      }
+      await new Promise(resolve => setImmediate(resolve))
+      assert.deepEqual(unhandled, [])
+    } finally {
+      process.off('unhandledRejection', record)
+    }
+  })
 })
 
 describe('readEach', () => {

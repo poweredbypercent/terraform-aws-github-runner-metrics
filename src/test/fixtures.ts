@@ -8,10 +8,10 @@ import type { GitHubScope } from '../domain/types.ts'
 export const NOW = Date.parse('2026-10-07T12:00:00Z')
 export const queueArn = (name: string): string => `arn:aws:sqs:eu-west-1:123456789012:${name}`
 /** A runner config's queues as the Terraform module writes them: the main one, and a dead letter. */
-export const queuesOf = (main: string, deadLetter?: string) => [
-  { arn: queueArn(main), kind: 'main' },
-  ...(deadLetter ? [{ arn: queueArn(deadLetter), kind: 'dead_letter' }] : []),
-]
+export const queuesOf = (main: string, deadLetter?: string) => ({
+  main: queueArn(main),
+  dead_letter: deadLetter ? queueArn(deadLetter) : null,
+})
 export const ORG: GitHubScope = { type: 'org', owner: 'acme', apiUrl: 'https://api.github.com' }
 export const signal = new AbortController().signal
 
@@ -33,21 +33,42 @@ export const cachedForTest = <T>(read: () => T | undefined): Cached<T> =>
     () => 0,
   )
 
-/** A parsed config with one runner config ("ci"), overridable field by field (snake_case). */
-export function testConfig(overrides: Record<string, unknown> = {}): Config {
-  return parseConfig(
-    JSON.stringify({
-      version: 1,
-      runner_configs: [
-        {
-          name: 'ci',
-          environment: 'ci',
-          max_runners: 10,
-          queues: queuesOf('ci-queued-builds'),
-        },
-      ],
-      remote_write: { url: 'http://localhost:9090/api/v1/write' },
-      ...overrides,
-    }),
-  )
+type Document = Record<string, unknown>
+
+/**
+ * CONFIG as the Terraform module renders it with its defaults, with one runner config ("ci"),
+ * overridable field by field (snake_case). `github`, `remote_write` and each runner config are
+ * merged one level deep, so a test names only what it is about; `undefined` leaves a field out.
+ */
+export function renderedConfig(overrides: Document = {}): Document {
+  const { runner_configs, github, remote_write, ...rest } = overrides
+  const runnerConfigs = (runner_configs as Document[] | undefined) ?? [
+    { name: 'ci', environment: 'ci', max_runners: 10, queues: queuesOf('ci-queued-builds') },
+  ]
+  return {
+    version: 1,
+    runner_configs: runnerConfigs.map(c => ({
+      max_runners: -1,
+      runner_name_prefix: '',
+      github_api_url: 'https://api.github.com',
+      labels: {},
+      ...c,
+    })),
+    github: { credentials: { type: 'none' }, owners: [], ...(github as Document | undefined) },
+    remote_write: {
+      url: 'http://localhost:9090/api/v1/write',
+      auth: { type: 'none' },
+      headers: {},
+      timeout_seconds: 10,
+      ...(remote_write as Document | undefined),
+    },
+    labels: {},
+    boot_grace_seconds: 30,
+    source_timeout_seconds: 10,
+    ...rest,
+  }
 }
+
+/** renderedConfig, parsed. */
+export const testConfig = (overrides: Document = {}): Config =>
+  parseConfig(JSON.stringify(renderedConfig(overrides)))

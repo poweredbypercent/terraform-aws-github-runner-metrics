@@ -98,6 +98,44 @@ describe('refreshingCredentials', () => {
     fail = false
     assert.equal((await flaky()).accessKeyId, 'AK')
   })
+
+  it('replaces a refresh that hangs, rather than waiting on it for good', async () => {
+    let now = 0
+    let calls = 0
+    const provider = refreshingCredentials(
+      async () => {
+        calls++
+        if (calls === 1) return new Promise<never>(() => {})
+        return issued(now + 15 * 60_000)
+      },
+      () => now,
+    )
+    void provider()
+    now = 10_000
+    void provider()
+    assert.equal(calls, 1, 'a refresh in flight is shared while it is young')
+    now = 31_000
+    assert.equal((await provider()).accessKeyId, `AK${31_000 + 15 * 60_000}`)
+    assert.equal(calls, 2)
+  })
+
+  it('keeps signing with unexpired credentials when a refresh fails', async () => {
+    let now = 0
+    let fail = false
+    const provider = refreshingCredentials(
+      async () => {
+        if (fail) throw new Error('sts down')
+        return issued(now + 15 * 60_000)
+      },
+      () => now,
+    )
+    const first = await provider()
+    fail = true
+    now = 12 * 60_000
+    assert.equal(await provider(), first, 'three minutes left: still signs')
+    now = 15 * 60_000
+    await assert.rejects(provider(), /sts down/)
+  })
 })
 
 describe('basic and bearer auth', () => {

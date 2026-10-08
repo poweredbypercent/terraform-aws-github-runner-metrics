@@ -7,7 +7,6 @@
  */
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { parseConfig } from '../src/config/parse.ts'
 import { scopeKey } from '../src/domain/scope.ts'
 import type { GitHubScope, RunnerInstance } from '../src/domain/types.ts'
 import { createVanishTracker } from '../src/model/vanish.ts'
@@ -15,6 +14,7 @@ import type { Sources } from '../src/ports.ts'
 import { type Deps, sampleOnce } from '../src/run.ts'
 import { noAuth } from '../src/sinks/auth.ts'
 import { remoteWriteSink } from '../src/sinks/remote-write/sink.ts'
+import { testConfig } from '../src/test/fixtures.ts'
 
 const PROMETHEUS = process.env.E2E_PROMETHEUS_URL
 if (!PROMETHEUS) {
@@ -26,22 +26,19 @@ const RUN = `e2e-${Date.now()}`
 const ARN = 'arn:aws:sqs:eu-west-1:123456789012:e2e-queued-builds'
 const ORG: GitHubScope = { type: 'org', owner: 'acme', apiUrl: 'https://api.github.com' }
 
-const config = parseConfig(
-  JSON.stringify({
-    version: 1,
-    runner_configs: [
-      {
-        name: 'linux',
-        environment: 'e2e',
-        max_runners: 8,
-        runner_name_prefix: 'linux',
-        queues: [{ arn: ARN, kind: 'main' }],
-      },
-    ],
-    remote_write: { url: `${PROMETHEUS}/api/v1/write` },
-    labels: { e2e_run: RUN },
-  }),
-)
+const config = testConfig({
+  runner_configs: [
+    {
+      name: 'linux',
+      environment: 'e2e',
+      max_runners: 8,
+      runner_name_prefix: 'linux',
+      queues: { main: ARN, dead_letter: null },
+    },
+  ],
+  remote_write: { url: `${PROMETHEUS}/api/v1/write` },
+  labels: { e2e_run: RUN },
+})
 
 async function query(
   promql: string,

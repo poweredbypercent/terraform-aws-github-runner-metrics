@@ -34,17 +34,23 @@ export class PushError extends Error {
 const MENTIONS_CREDENTIALS =
   /authorization|x-amz-|signature|credential|bearer|basic |token|password|secret/i
 
+/** Enough of a 400's body to say which samples were rejected and why. */
+const EXPLANATION_CHARS = 300
+/** A failure that may pass (a 5xx, a network error) is tried once more, after this pause. */
+const ATTEMPTS = 2
+const RETRY_DELAY_MS = 500
+
 async function explain(response: Response): Promise<string> {
   if (response.status !== 400) return ''
   const body = (await response.text().catch(() => '')).replace(/[^\x20-\x7e]+/g, ' ').trim()
   if (MENTIONS_CREDENTIALS.test(body)) return ' (body withheld: it may echo credentials)'
-  return ` ${body.slice(0, 300)}`.trimEnd()
+  return ` ${body.slice(0, EXPLANATION_CHARS)}`.trimEnd()
 }
 
 export async function post(
   fetchImpl: Fetch,
   request: { url: string; headers: Record<string, string>; body: Uint8Array; timeoutMs: number },
-  retryDelayMs = 500,
+  retryDelayMs = RETRY_DELAY_MS,
 ): Promise<void> {
   const deadline = Date.now() + request.timeoutMs
   for (let attempt = 1; ; attempt++) {
@@ -71,7 +77,7 @@ export async function post(
       failure = new PushError(`remote_write: ${describeError(err)}`)
       retryable = true
     }
-    if (!retryable || attempt >= 2 || deadline - Date.now() <= retryDelayMs) throw failure
+    if (!retryable || attempt >= ATTEMPTS || deadline - Date.now() <= retryDelayMs) throw failure
     await new Promise(resolve => setTimeout(resolve, retryDelayMs))
   }
 }

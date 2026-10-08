@@ -40,22 +40,21 @@ variable "runner_stacks" {
     condition     = alltrue([for s in var.runner_stacks : s.runners == null || s.name != null])
     error_message = "runner_stacks[].name is required for a root-module stack (runners): it is the runner_config label of its series."
   }
-
-  validation {
-    condition     = alltrue([for s in var.runner_stacks : s.name == null || can(regex("^[A-Za-z0-9_.-]+$", s.name))])
-    error_message = "runner_stacks[].name may contain only letters, digits, '.', '-' and '_'."
-  }
 }
 
 variable "runner_configs" {
   description = <<-EOT
     Runner configs given explicitly, for stacks whose outputs are not to hand (another state, another
-    tool). The key is the runner_config label. `environment` is the stack's ghr:environment tag
-    value. `queues` defaults to "<environment>-queued-builds" and its "_dead_letter" queue in this
-    account and region; give them for queues named otherwise, as
-    { main = "<ARN>", dead_letter = "<ARN>" } with dead_letter optional. `max_runners` -1 is
-    unlimited. `labels` are added to this runner config's series (Prometheus label names, not a
+    tool). The key is the runner_config label (letters, digits, '.', '-' and '_'). `environment` is
+    the stack's ghr:environment tag value (letters, digits, '-' and '_'). `queues` defaults to
+    "<environment>-queued-builds" and its "_dead_letter" queue in this account and region; give
+    them for queues named otherwise, as { main = "<ARN>", dead_letter = "<ARN>" } with dead_letter
+    optional, never a wildcard. `max_runners` is -1 (unlimited) or 0-100000. `github_api_url` is
+    an https URL. `labels` are added to this runner config's series (Prometheus label names, not a
     built-in label, non-empty values).
+
+    These rules hold for runner configs read from runner_stacks too, so they are checked once, on
+    both, at plan.
   EOT
   type = map(object({
     environment        = string
@@ -70,41 +69,6 @@ variable "runner_configs" {
   }))
   default  = {}
   nullable = false
-
-  validation {
-    condition     = alltrue([for name in keys(var.runner_configs) : can(regex("^[A-Za-z0-9_.-]+$", name))])
-    error_message = "runner_configs keys may contain only letters, digits, '.', '-' and '_'."
-  }
-
-  validation {
-    condition     = alltrue([for c in values(var.runner_configs) : can(regex("^[A-Za-z0-9_-]+$", c.environment))])
-    error_message = "runner_configs[].environment may contain only letters, digits, '-' and '_' (it names the queues)."
-  }
-
-  validation {
-    condition     = alltrue([for c in values(var.runner_configs) : c.max_runners == -1 || (c.max_runners >= 0 && c.max_runners <= 100000)])
-    error_message = "runner_configs[].max_runners must be -1 (unlimited) or from 0 to 100000."
-  }
-
-  validation {
-    # They go into the role's policy: a wildcard would grant every queue it matches.
-    condition = alltrue(flatten([
-      for c in values(var.runner_configs) : [
-        for arn in compact([try(c.queues.main, null), try(c.queues.dead_letter, null)]) :
-        can(regex("^arn:aws[a-z-]*:sqs:[a-z0-9-]+:[0-9]{12}:([A-Za-z0-9_-]{1,80}|[A-Za-z0-9_-]{1,75}\\.fifo)$", arn))
-      ]
-    ]))
-    error_message = "runner_configs[].queues must be SQS queue ARNs, without wildcards."
-  }
-
-  validation {
-    # The App's tokens are sent there.
-    condition = alltrue([
-      for c in values(var.runner_configs) :
-      c.github_api_url == null || can(regex("^https://[^\\s/@?#]+(/[^\\s?#]*)?$", c.github_api_url))
-    ])
-    error_message = "runner_configs[].github_api_url must be an https:// URL without credentials or a query string."
-  }
 }
 
 variable "labels" {
@@ -139,7 +103,8 @@ variable "github_app" {
     installed on.
 
     ssm (runner_ssm only): the runner module's parameter names, { app_id_parameter_name,
-    private_key_base64_parameter_name }, when they cannot be read from the runner stacks.
+    private_key_base64_parameter_name }, when they cannot be read from the runner stacks. Never
+    wildcards: the role is granted exactly those parameters.
 
     recovery_window_in_days (create_secret only): how long a destroyed secret can be restored, 0 or
     7-30. While it lasts, its name cannot be used again, so a destroy and re-apply of the same
@@ -194,15 +159,6 @@ variable "github_app" {
   }
 
   validation {
-    # They go into the role's policy: a wildcard would grant every parameter it matches.
-    condition = var.github_app.ssm == null || alltrue([
-      for name in [try(var.github_app.ssm.app_id_parameter_name, ""), try(var.github_app.ssm.private_key_base64_parameter_name, "")] :
-      can(regex("^/?[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$", name))
-    ])
-    error_message = "github_app.ssm parameter names must be SSM parameter names, without wildcards."
-  }
-
-  validation {
     condition     = var.github_app.recovery_window_in_days == 0 || (var.github_app.recovery_window_in_days >= 7 && var.github_app.recovery_window_in_days <= 30)
     error_message = "github_app.recovery_window_in_days must be 0 or from 7 to 30."
   }
@@ -214,7 +170,7 @@ variable "github_enterprise_server_url" {
   default     = null
 
   validation {
-    condition     = var.github_enterprise_server_url == null || can(regex("^https://[^/]+/?$", var.github_enterprise_server_url))
+    condition     = var.github_enterprise_server_url == null || can(regex("^https://[A-Za-z0-9_.-]+(:[0-9]{1,5})?/?$", var.github_enterprise_server_url))
     error_message = "github_enterprise_server_url must be an https:// base URL with no path."
   }
 }
@@ -225,20 +181,27 @@ variable "github_enterprise_server_url" {
 
 variable "remote_write" {
   description = <<-EOT
-    The Prometheus remote_write endpoint, and how to authenticate to it. At most one of:
+    The Prometheus remote_write endpoint, and how to authenticate to it.
 
-      sigv4    Amazon Managed Service for Prometheus. role_arn: a writer role to assume (for a
-               workspace in another account); without it the Lambda's own role signs, and needs
+    url: the endpoint itself (a redirect is not followed), http or https, without credentials, a
+    query string or a fragment. https whenever auth is set.
+
+    auth, at most one of:
+
+      sigv4    Amazon Managed Service for Prometheus. region: read from an AWS hostname (an AMP or
+               VPC endpoint URL) when not given. service: "aps" by default. role_arn: a writer role
+               to assume (for a workspace in another account), with external_id if its trust
+               policy requires one; without a role the Lambda's own role signs, and needs
                aps:RemoteWrite (see additional_policy_json).
       basic    a Secrets Manager secret with {"username": "...", "password": "..."} (Grafana Cloud).
       bearer   a Secrets Manager secret with {"token": "..."} or the bare token.
 
-    headers: plain, non-secret extras such as X-Scope-OrgID for Mimir; they are visible in the
+    headers: plain, non-secret extras such as X-Scope-OrgID for Mimir. They are visible in the
     function's configuration, so a header named like a credential (key, token, secret, auth...)
-    is refused.
+    is refused, as are the headers the client sets itself.
 
-    The URL must be the endpoint itself: a redirect is not followed. With sigv4 and no region, the
-    region is read from an AWS hostname (an AMP or VPC endpoint URL).
+    timeout_seconds: how long a push may take, its one retry included (1-60, default 10). It has to
+    fit in lambda_timeout with the sources' budgets (see lambda_timeout).
   EOT
   type = object({
     url = string
@@ -258,7 +221,7 @@ variable "remote_write" {
 
   validation {
     # Credentials or a token in the URL would end up in the function's configuration and logs.
-    condition     = can(regex("^https?://[^\\s/@?#]+(/[^\\s?#]*)?$", var.remote_write.url))
+    condition     = can(regex("^https?://[A-Za-z0-9_.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*)?$", var.remote_write.url))
     error_message = "remote_write.url must be an http(s) URL without credentials, a query string or a fragment."
   }
 
@@ -291,6 +254,19 @@ variable "remote_write" {
   }
 
   validation {
+    condition = (
+      try(var.remote_write.auth.sigv4.region, null) == null ||
+      can(regex("^[a-z0-9-]+$", var.remote_write.auth.sigv4.region))
+    )
+    error_message = "remote_write.auth.sigv4.region must be an AWS region name, such as eu-west-1."
+  }
+
+  validation {
+    condition     = var.remote_write.auth.sigv4 == null || can(regex("^[a-z0-9-]+$", var.remote_write.auth.sigv4.service))
+    error_message = "remote_write.auth.sigv4.service must be the signing name of an AWS service, such as aps."
+  }
+
+  validation {
     # It goes into the role's policy: a wildcard would let it assume every role it matches.
     condition = (
       try(var.remote_write.auth.sigv4.role_arn, null) == null ||
@@ -305,6 +281,16 @@ variable "remote_write" {
   }
 
   validation {
+    # What STS accepts. A conditional, not ||: length(null) fails, and Terraform before 1.12
+    # evaluates both sides of ||.
+    condition = try(var.remote_write.auth.sigv4.external_id, null) == null ? true : (
+      can(regex("^[A-Za-z0-9_+=,./:@-]+$", var.remote_write.auth.sigv4.external_id)) &&
+      length(var.remote_write.auth.sigv4.external_id) >= 2 && length(var.remote_write.auth.sigv4.external_id) <= 1224
+    )
+    error_message = "remote_write.auth.sigv4.external_id must be 2-1224 letters, digits or _+=,./:@-."
+  }
+
+  validation {
     condition = alltrue([
       for name in keys(var.remote_write.headers) :
       can(regex("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$", name)) &&
@@ -316,7 +302,7 @@ variable "remote_write" {
 
   validation {
     # They are visible in the function's configuration: credentials belong in basic or bearer auth.
-    condition     = alltrue([for name in keys(var.remote_write.headers) : !can(regex("(?i)key|token|secret|passw|credential|auth|cookie|session", name))])
+    condition     = alltrue([for name in keys(var.remote_write.headers) : !can(regex("key|token|secret|passw|credential|auth|cookie|session", lower(name)))])
     error_message = "remote_write.headers looks like it carries a credential: use remote_write.auth basic or bearer, which keep it in a secret."
   }
 
@@ -341,6 +327,9 @@ variable "lambda_zip" {
     modules/download-lambda to fetch and verify one) or an object in S3, pinned by its
     object_version: the function runs with access to the GitHub App's key, so it deploys exactly the
     object you verified, and a new version is deployed by changing it.
+
+    source_code_hash (path only): the zip's base64 SHA-256, for a zip that does not exist yet at
+    plan (modules/download-lambda outputs it). Without it the file is hashed at plan.
   EOT
   type = object({
     path             = optional(string)
@@ -356,6 +345,12 @@ variable "lambda_zip" {
   validation {
     condition     = (var.lambda_zip.path == null) != (var.lambda_zip.s3 == null)
     error_message = "lambda_zip sets exactly one of path or s3."
+  }
+
+  validation {
+    # An empty version is no version: the provider would deploy whatever object is latest.
+    condition     = var.lambda_zip.s3 == null || can(regex("^\\S+$", var.lambda_zip.s3.object_version))
+    error_message = "lambda_zip.s3.object_version must be the object's version id."
   }
 }
 
@@ -422,7 +417,7 @@ variable "lambda_memory_size" {
 }
 
 variable "lambda_timeout" {
-  description = "Seconds. Keep it under the schedule interval so samples never overlap, and long enough for a slow sample: at least 2 x source_timeout_seconds + remote_write.timeout_seconds + 5, which the module enforces."
+  description = "Seconds, 10-59. Keep it under the schedule interval so samples never overlap, and long enough for a slow sample: at least 2 x source_timeout_seconds + remote_write.timeout_seconds + 5, which the module enforces. That bounds the other two: a source budget of 26 seconds at most, a push budget of 52."
   type        = number
   default     = 45
 
@@ -444,7 +439,7 @@ variable "reserved_concurrent_executions" {
 }
 
 variable "source_timeout_seconds" {
-  description = "Budget for each source (SQS, CloudWatch, EC2, GitHub) in each sample."
+  description = "Budget for each source (SQS, CloudWatch, EC2, GitHub) in each sample, 1-60; it has to fit in lambda_timeout with the push (see lambda_timeout)."
   type        = number
   default     = 10
 
@@ -477,16 +472,27 @@ variable "log_retention_in_days" {
 }
 
 variable "kms_key_arn" {
-  description = "Customer-managed KMS key for the log group, the function's environment and the created secret. The key policy must allow logs.<region>.amazonaws.com. null: AWS-managed keys."
+  description = "Customer-managed KMS key ARN for the log group, the function's environment and the created secret. The key policy must allow logs.<region>.amazonaws.com. null: AWS-managed keys."
   type        = string
   default     = null
+
+  validation {
+    # It goes into the role's policy: a wildcard would let it decrypt with every key it matches.
+    condition     = var.kms_key_arn == null || can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$", var.kms_key_arn))
+    error_message = "kms_key_arn must be one key's ARN (arn:...:key/<id>), without wildcards."
+  }
 }
 
 variable "secrets_kms_key_arns" {
-  description = "Other customer-managed keys that encrypt secrets or parameters this module reads (an existing GitHub App secret, a remote-write credential, the runner module's SSM parameters)."
+  description = "Other customer-managed key ARNs that encrypt secrets or parameters this module reads (an existing GitHub App secret, a remote-write credential, the runner module's SSM parameters)."
   type        = list(string)
   default     = []
   nullable    = false
+
+  validation {
+    condition     = alltrue([for arn in var.secrets_kms_key_arns : can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$", arn))])
+    error_message = "secrets_kms_key_arns must be keys' ARNs (arn:...:key/<id>), without wildcards."
+  }
 }
 
 variable "vpc_config" {

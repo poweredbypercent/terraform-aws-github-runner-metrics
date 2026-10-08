@@ -12,8 +12,9 @@ Several tools cover part of it; none covers a terraform-aws-github-runner stack 
 
 ## What this module adds
 
-- **Booting runners.** Instances that have launched but not registered with GitHub, found by
-  joining EC2 instances to GitHub runners by instance id. With the scale-up queue, this gives the
+- **Booting runners.** Instances that have launched but whose runner is not online with GitHub
+  yet (a just-in-time runner is registered before it boots), found by joining EC2 instances to
+  GitHub runners by instance id. With the scale-up queue, this gives the
   number of jobs waiting for a runner. No tool that reads only AWS or only GitHub can produce it.
 - **The fleet by runner config.** Instances by type, spot or on-demand, and state; capacity;
   orphans. Each series carries the `runner_config` and `environment` labels, read from the runner
