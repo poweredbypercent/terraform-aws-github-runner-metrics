@@ -30,17 +30,26 @@ workflows with actionlint and zizmor.
   changing it. Names start `github_aws_runners_`, gauges never end in `_total`, and runner names or
   instance ids are never labels.
 - A source that fails leaves its series out; never report an unknown as zero.
+- `src/domain` and `src/model` are plain logic: the domain imports only itself, the model only
+  the domain and itself (`src/layers.test.ts`). Configuration, SDKs and I/O stay in the adapters.
 - The Terraform module hands the Lambda one JSON document, `CONFIG` (`config.tf`, read by
   `src/config/parse.ts`). A change to it changes the `src/test/config.v1.*.json` documents too:
-  `main.tftest.hcl` checks the module renders each, and `src/config/contract.test.ts` what the
-  Lambda takes each to mean. Add a field with nothing for an older Lambda to misread; bump
-  `version` only for a change an older Lambda cannot read, since the module and the zip are
-  pinned separately.
+  `main.tftest.hcl` renders each, and `src/config/contract.test.ts` checks what the Lambda takes
+  each to mean, and that every one has its terraform test run.
+- The Lambda requires every field the module renders, so a module and zip of different versions
+  can disagree: each release's zip goes with that release's module. An older Lambda ignores a
+  field it does not know, so add a new field to the module a release before the Lambda requires
+  it; bump `version` for a change an older Lambda would misread, so the mismatch is named.
 - What would make the Lambda reject `CONFIG` is refused by the module first, never left to fail at
   runtime: as a variable's validation when the rule is about that variable alone, otherwise as an
-  entry of `local.rejected` (`validation.tf`) and a precondition on what it protects. The patterns
-  both sides use are in `src/config/patterns.ts`, and `src/config/parity.test.ts` fails when the
-  module's copy differs. Each refusal has a test that names the rule it expects.
+  entry of `local.rejected` (`validation.tf`) and a precondition on what it protects. The two rules
+  with no offenders to name, no runner configs at all and a timeout too short, are preconditions
+  of their own. The patterns, limits and reserved headers both sides use are in
+  `src/config/rules.ts`, label names in `src/domain/labels.ts`, and `src/config/parity.test.ts`
+  fails when the module's copy differs.
+- Each refusal has a test. One of `local.rejected` asserts, through `local.refused`, that its rule
+  alone refused; one of a variable's validations breaks only that rule, since Terraform names just
+  the variable.
 - Keep the Lambda's dependencies to the AWS SDK.
 
 ## Releasing
@@ -48,7 +57,7 @@ workflows with actionlint and zizmor.
 1. Bump `version` in `package.json` on `main`.
 2. Tag the commit `vX.Y.Z` and push the tag. The release workflow runs CI, builds the zip, waits
    for a reviewer to approve the `release` environment, then checks, attests and publishes it.
-   Re-running a failed publish finishes the same release.
+   Re-running a failed publish replaces its draft with the same build.
 
 There are deliberately no floating `vX` / `vX.Y` tags. Consumers pin an exact version (and
 `modules/download-lambda` refuses anything else), and a workflow that never writes tags needs

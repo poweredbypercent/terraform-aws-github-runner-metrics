@@ -92,13 +92,13 @@ resource "aws_lambda_function" "this" {
       error_message = "Constant labels (labels, runner_stacks[].labels, runner_configs[].labels) must be Prometheus label names, not start with \"__\", not reuse a built-in label, and have a value: ${join(", ", local.rejected.labels)}."
     }
     precondition {
-      condition     = length(local.rejected.ssm_parameters) == 0
-      error_message = "github_app.source = \"runner_ssm\" but the runner module's GitHub App parameter names were not found (${join(", ", local.rejected.ssm_parameters)}); set github_app.ssm."
+      condition     = length(local.rejected.missing_ssm_parameters) == 0
+      error_message = "github_app.source = \"runner_ssm\" but the runner module's GitHub App parameter names were not found (${join(", ", local.rejected.missing_ssm_parameters)}); set github_app.ssm."
     }
     precondition {
       # GitHub waits for EC2, so two source budgets run back to back, then the push.
       condition     = var.lambda_timeout >= 2 * var.source_timeout_seconds + var.remote_write.timeout_seconds + 5
-      error_message = "lambda_timeout is too short to finish a slow sample: 2 x source_timeout_seconds + remote_write.timeout_seconds + 5 is ${2 * var.source_timeout_seconds + var.remote_write.timeout_seconds + 5} seconds, and lambda_timeout is at most 59."
+      error_message = "A slow sample needs a lambda_timeout of at least ${2 * var.source_timeout_seconds + var.remote_write.timeout_seconds + 5} seconds (2 x source_timeout_seconds + remote_write.timeout_seconds + 5), and it is ${var.lambda_timeout}. Raise lambda_timeout (at most 59), or lower those budgets."
     }
   }
 }

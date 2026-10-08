@@ -1,7 +1,7 @@
 import { invalidLabelName } from '../domain/labels.ts'
 import { err, ok, type Result } from '../domain/result.ts'
 import type { QueueKind, QueueRef, RunnerConfig } from '../domain/types.ts'
-import { PATTERNS, RESERVED_HEADERS } from './patterns.ts'
+import { LIMITS, PATTERNS, RESERVED_HEADER_PREFIX, RESERVED_HEADERS } from './rules.ts'
 import type { Config, GitHubCredentials, RemoteWriteAuth, RemoteWriteConfig } from './types.ts'
 
 /**
@@ -9,7 +9,7 @@ import type { Config, GitHubCredentials, RemoteWriteAuth, RemoteWriteConfig } fr
  *
  * Every problem is collected and reported together, so a misconfiguration is fixed in one
  * deploy rather than one error per cold start. The module refuses the same values first (see
- * patterns.ts); this is the Lambda's own guard, since the variable can also be set by hand. Every
+ * rules.ts); this is the Lambda's own guard, since the variable can also be set by hand. Every
  * field the module renders is required here: its defaults live in the module alone.
  */
 
@@ -62,7 +62,7 @@ class Reader {
     return ''
   }
 
-  number(value: Json, at: string, min: number, max: number): number {
+  number(value: Json, at: string, { min, max }: { min: number; max: number }): number {
     if (typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max) {
       return value
     }
@@ -87,6 +87,8 @@ class Reader {
 }
 
 const pattern = (name: keyof typeof PATTERNS) => new RegExp(PATTERNS[name])
+const RUNNER_CONFIG_NAME = pattern('runnerConfigName')
+const ENVIRONMENT = pattern('environment')
 const SQS_QUEUE_ARN = pattern('sqsQueueArn')
 const SECRET_ARN = pattern('secretArn')
 const ROLE_ARN = pattern('roleArn')
@@ -141,10 +143,10 @@ function endpointUrl(r: Reader, value: Json, at: string, requireHttps: boolean):
 function runnerConfig(r: Reader, value: Json, at: string): RunnerConfig {
   const o = r.object(value, at)
   return {
-    name: r.string(o.name, `${at}.name`, pattern('runnerConfigName')),
-    environment: r.string(o.environment, `${at}.environment`, pattern('environment')),
+    name: r.string(o.name, `${at}.name`, RUNNER_CONFIG_NAME),
+    environment: r.string(o.environment, `${at}.environment`, ENVIRONMENT),
     maxRunners:
-      o.max_runners === -1 ? null : r.number(o.max_runners, `${at}.max_runners`, 0, 100_000),
+      o.max_runners === -1 ? null : r.number(o.max_runners, `${at}.max_runners`, LIMITS.maxRunners),
     runnerNamePrefix: r.text(o.runner_name_prefix, `${at}.runner_name_prefix`),
     // Always https: the App's installation tokens are sent there.
     githubApiUrl: endpointUrl(r, o.github_api_url, `${at}.github_api_url`, true),
@@ -172,9 +174,6 @@ function githubCredentials(r: Reader, value: Json, at: string): GitHubCredential
   }
 }
 
-/** STS's bounds on an external id. */
-const EXTERNAL_ID_LENGTH = { min: 2, max: 1224 }
-
 function remoteWriteAuth(r: Reader, value: Json, at: string): RemoteWriteAuth {
   const o = r.object(value, at)
   switch (o.type) {
@@ -184,13 +183,9 @@ function remoteWriteAuth(r: Reader, value: Json, at: string): RemoteWriteAuth {
       const roleArn = r.optionalString(o.role_arn, `${at}.role_arn`, ROLE_ARN)
       const externalId = r.optionalString(o.external_id, `${at}.external_id`, EXTERNAL_ID)
       if (externalId && !roleArn) r.problems.push(`${at}.external_id needs role_arn`)
-      if (
-        externalId &&
-        (externalId.length < EXTERNAL_ID_LENGTH.min || externalId.length > EXTERNAL_ID_LENGTH.max)
-      ) {
-        r.problems.push(
-          `${at}.external_id must be ${EXTERNAL_ID_LENGTH.min}-${EXTERNAL_ID_LENGTH.max} characters`,
-        )
+      const { min, max } = LIMITS.externalIdLength
+      if (externalId && (externalId.length < min || externalId.length > max)) {
+        r.problems.push(`${at}.external_id must be ${min}-${max} characters`)
       }
       return {
         type: 'sigv4',
@@ -211,9 +206,9 @@ function remoteWriteAuth(r: Reader, value: Json, at: string): RemoteWriteAuth {
   }
 }
 
-/** SigV4's own headers (x-amz-date, x-amz-security-token, ...) are the signer's to set. */
 const isReservedHeader = (name: string): boolean =>
-  RESERVED_HEADERS.includes(name.toLowerCase()) || name.toLowerCase().startsWith('x-amz-')
+  RESERVED_HEADERS.includes(name.toLowerCase()) ||
+  name.toLowerCase().startsWith(RESERVED_HEADER_PREFIX)
 
 function remoteWrite(r: Reader, value: Json, at: string): RemoteWriteConfig {
   const o = r.object(value, at)
@@ -234,7 +229,7 @@ function remoteWrite(r: Reader, value: Json, at: string): RemoteWriteConfig {
               : undefined,
       HEADER_VALUE,
     ),
-    timeoutMs: r.number(o.timeout_seconds, `${at}.timeout_seconds`, 1, 60) * 1000,
+    timeoutMs: r.number(o.timeout_seconds, `${at}.timeout_seconds`, LIMITS.timeoutSeconds) * 1000,
   }
 }
 
@@ -278,8 +273,9 @@ export function parseConfig(raw: string | undefined): Config {
     github: { credentials, owners },
     remoteWrite: remoteWrite(r, o.remote_write, 'remote_write'),
     labels: r.stringMap(o.labels, 'labels', invalidLabelName),
-    bootGraceSeconds: r.number(o.boot_grace_seconds, 'boot_grace_seconds', 0, 3600),
-    sourceTimeoutMs: r.number(o.source_timeout_seconds, 'source_timeout_seconds', 1, 60) * 1000,
+    bootGraceSeconds: r.number(o.boot_grace_seconds, 'boot_grace_seconds', LIMITS.bootGraceSeconds),
+    sourceTimeoutMs:
+      r.number(o.source_timeout_seconds, 'source_timeout_seconds', LIMITS.timeoutSeconds) * 1000,
   }
   if (r.problems.length > 0) throw new ConfigError(r.problems)
   return config

@@ -5,7 +5,7 @@ name: Release
 # release with the zip and its SHA-256. The attestation comes after the approval, so a build that
 # was never approved has none. There are no floating vX / vX.Y tags: consumers pin vX.Y.Z, and the
 # workflow never writes a tag, so the built-in token is enough and the tag ruleset needs no bypass
-# for automation. Re-running a failed publish finishes the same release.
+# for automation. Re-running a failed publish replaces its draft with the same build.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+', 'v[0-9]+.[0-9]+.[0-9]+-*']
@@ -114,16 +114,29 @@ jobs:
             --source-ref refs/tags/${TAG} --deny-self-hosted-runners
           \`\`\`
           EOF
-          prerelease=""
-          [[ "${TAG}" == *-* ]] && prerelease="--prerelease"
+          prerelease=false
+          [[ "${TAG}" == *-* ]] && prerelease=true
+          releases="repos/${GITHUB_REPOSITORY}/releases"
           # Draft first and publish once every asset is attached, so the release is complete the
           # moment it appears (and works with immutable releases). A published release is left
-          # alone: it can no longer change. A draft is replaced, not adopted: anyone who can write
-          # to the repository can edit a draft, so only what this run built is published.
-          draft="$(gh release view "${TAG}" --json isDraft --jq .isDraft 2>/dev/null || echo missing)"
-          case "${draft}" in
-            false) echo "${TAG} is already published"; exit 0 ;;
-            true) gh release delete "${TAG}" --yes ;;
-          esac
-          gh release create "${TAG}" --draft --verify-tag --title "${TAG}" --notes-file notes.md ${prerelease} assets/*
-          gh release edit "${TAG}" --draft=false
+          # alone: it can no longer change. Drafts are anyone-with-write's to create and edit, and
+          # a tag can have several, so every draft for the tag goes, and the one this run creates
+          # is published by its id, holding exactly the assets this run built.
+          existing="$(gh api --paginate "${releases}" --jq '.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)"')"
+          if grep -q ' false$' <<<"${existing}"; then echo "${TAG} is already published"; exit 0; fi
+          while read -r stale _; do
+            if [ -n "${stale}" ]; then gh api -X DELETE "${releases}/${stale}" --silent; fi
+          done <<<"${existing}"
+          # The tag must exist already: a release for a missing tag would create it.
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --silent
+          read -r id upload < <(gh api "${releases}" -f tag_name="${TAG}" -f name="${TAG}" \
+            -F draft=true -F prerelease="${prerelease}" -F body=@notes.md --jq '"\(.id) \(.upload_url)"')
+          for asset in assets/*; do
+            gh api -X POST "${upload%%\{*}?name=$(basename "${asset}")" \
+              -H "Content-Type: application/octet-stream" --input "${asset}" --silent
+          done
+          expected="$(cd assets && sha256sum -- * | awk '{print "sha256:" $1 " " $2}' | sort)"
+          assets_of() { gh api "${releases}/${id}" --jq '.assets[] | "\(.digest) \(.name)"' | sort; }
+          [ "$(assets_of)" = "${expected}" ] || { echo "::error::the draft holds other assets than this run built"; exit 1; }
+          gh api -X PATCH "${releases}/${id}" -f name="${TAG}" -F body=@notes.md -F draft=false --silent
+          [ "$(assets_of)" = "${expected}" ] || { echo "::error::${TAG}'s assets changed while it was published"; exit 1; }

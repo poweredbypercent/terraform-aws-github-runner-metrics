@@ -30,16 +30,22 @@ The Lambda code, the Terraform modules, and the release pipeline that builds and
   Remote-write redirects are not followed, so signed headers and samples only go to the configured
   endpoint. Plain `headers` named like a credential are refused: they would be visible in the
   function's configuration.
+- The runner stacks' outputs are trusted configuration, like the module's own inputs: they name
+  the queues and parameters the role may read, and a stack's GitHub Enterprise Server URL is where
+  the App's tokens are sent. `github_enterprise_server_url` overrides every stack's, so set it to
+  pin that destination when the stacks are maintained by others.
 - Logs carry error messages and HTTP statuses, never request headers, tokens or secrets. A
   remote-write response body is logged only for a 400, which explains rejected samples. Answers
   from GitHub are checked where they arrive and never quoted in errors.
 - Releases are built in CI from a tagged commit on `main` and are reproducible. Once a reviewer
   approves the protected `release` environment, the published zip is checked against the hash the
   build computed, attested, and published with its SHA-256 (see the README for the full
-  `gh attestation verify` command). A draft left by an earlier run is replaced, never adopted, so a
-  release holds only what that run built. `modules/download-lambda` requires one of them as a trust
-  anchor and verifies the zip again on every plan. The pinned SHA-256 is the stronger anchor: the
-  attestation names the tag, so it relies on the repository's tag ruleset as well.
+  `gh attestation verify` command). `modules/download-lambda` requires the SHA-256 pin or the
+  attestation as a trust anchor and verifies the zip again on every plan. The pinned SHA-256 is the
+  stronger anchor: the attestation names the tag, so it relies on the repository's tag ruleset as
+  well. Drafts, which anyone with write access can edit, are not trusted: every draft for the tag
+  is deleted, and the release published is the one the run created, by its id, after its assets'
+  digests are checked against the build's.
 - The S3 deployment path requires the object version, so the deployed code is the object that was
   verified. The module's own code, `download.sh` included, comes from the module source's `?ref=`;
   pin it to a commit to rely on nothing else.

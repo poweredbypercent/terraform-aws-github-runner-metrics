@@ -67,9 +67,10 @@ const CREDENTIAL_REFRESH_GIVE_UP_MS = 30_000
 /**
  * A provider that keeps its credentials until shortly before they expire. The SDK's assume-role
  * provider does not cache by itself (its clients do, around it), and called straight from the
- * signer it would call STS on every push. Concurrent callers share one refresh, but not forever:
- * one that hangs is replaced, so a single stuck STS call cannot fail every later push. When a
- * refresh fails, credentials that have not expired yet keep signing until the next attempt.
+ * signer it would call STS on every push. Within the margin, a refresh starts in the background
+ * and credentials that have not expired keep signing meanwhile, so a slow, failing or hung STS
+ * call costs no sample until they do expire. Callers that must wait share one refresh, but not
+ * forever: one that hangs is replaced.
  */
 export function refreshingCredentials(
   provider: CredentialProvider,
@@ -85,26 +86,23 @@ export function refreshingCredentials(
     const attempt = {
       started: now(),
       done: provider()
-        .then(
-          credentials => {
-            current = credentials
-            return credentials
-          },
-          error => {
-            if (current && remainingMs(current) > 0) return current
-            throw error
-          },
-        )
+        .then(credentials => {
+          current = credentials
+          return credentials
+        })
         .finally(() => {
           if (refresh === attempt) refresh = undefined
         }),
     }
+    // A background refresh may have no one waiting for it; its failure is the next caller's.
+    attempt.done.catch(() => {})
     return attempt
   }
   return async () => {
     if (current && remainingMs(current) > CREDENTIAL_REFRESH_MARGIN_MS) return current
     if (!refresh || now() - refresh.started > CREDENTIAL_REFRESH_GIVE_UP_MS)
       refresh = startRefresh()
+    if (current && remainingMs(current) > 0) return current
     return refresh.done
   }
 }

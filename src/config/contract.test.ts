@@ -8,11 +8,12 @@ import { CONFIG_VERSION, parseConfig } from './parse.ts'
  * The CONFIG contract between the Terraform module and the Lambda. main.tftest.hcl asserts that the
  * module renders exactly each src/test/config.v1.*.json for a fixed set of inputs; this asserts
  * that the Lambda reads those same documents, and what it takes them to mean. A change on either
- * side fails here or there, not at deploy. Between them they cover each way of reading GitHub and
- * of authenticating to remote write.
+ * side fails here or there, not at deploy. Between them they cover each kind of GitHub credentials
+ * (none, secret, ssm) and of remote-write auth (none, sigv4, basic, bearer).
  */
 const directory = new URL('../test/', import.meta.url)
-const rendered = readdirSync(directory).filter(name => /^config\.v\d+\..+\.json$/.test(name))
+const documents = readdirSync(directory).filter(name => /^config\.v\d+\..+\.json$/.test(name))
+const terraformTests = readFileSync(new URL('../../main.tftest.hcl', import.meta.url), 'utf8')
 
 const queues = (refs: readonly QueueRef[]) => refs.map(q => `${q.kind}:${q.name}`)
 
@@ -122,14 +123,46 @@ const MEANING: Record<string, unknown> = {
     bootGraceSeconds: 60,
     sourceTimeoutMs: 15_000,
   },
+  'config.v1.unauthenticated.json': {
+    runnerConfigs: [
+      {
+        name: 'ci',
+        environment: 'ci',
+        maxRunners: 5,
+        runnerNamePrefix: '',
+        githubApiUrl: 'https://api.github.com',
+        queues: ['main:ci-queued-builds', 'dead_letter:ci-queued-builds_dead_letter'],
+        labels: { pool: 'general' },
+      },
+    ],
+    github: { credentials: { type: 'none' }, owners: [] },
+    remoteWrite: {
+      url: 'http://mimir.monitoring.svc:9009/api/v1/push',
+      auth: { type: 'none' },
+      headers: { 'X-Scope-OrgID': 'ci' },
+      timeoutMs: 10_000,
+    },
+    labels: {},
+    bootGraceSeconds: 30,
+    sourceTimeoutMs: 10_000,
+  },
 }
 
 describe('the CONFIG the Terraform module renders', () => {
-  it('has a meaning written down for every rendered document, and no other', () => {
-    assert.deepEqual([...rendered].sort(), Object.keys(MEANING).sort())
+  it('has a meaning written down for every document, and no other', () => {
+    assert.deepEqual([...documents].sort(), Object.keys(MEANING).sort())
   })
 
-  for (const name of rendered) {
+  it('has a terraform test run rendering every document', () => {
+    for (const name of documents) {
+      assert.ok(
+        terraformTests.includes(`file("src/test/${name}")`),
+        `main.tftest.hcl renders no ${name}: nothing checks the module still produces it`,
+      )
+    }
+  })
+
+  for (const name of documents) {
     it(`${name} is the version this Lambda reads, and means what the module meant`, () => {
       const text = readFileSync(new URL(name, directory), 'utf8')
       assert.equal(JSON.parse(text).version, CONFIG_VERSION)

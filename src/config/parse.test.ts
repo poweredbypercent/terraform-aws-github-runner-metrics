@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { queuesOf, renderedConfig } from '../test/fixtures.ts'
+import { queuesOf, renderedConfig, testConfig } from '../test/fixtures.ts'
 import { ConfigError, parseConfig, queueFromArn } from './parse.ts'
 
 const linux = {
@@ -13,6 +13,8 @@ const linux = {
 
 const withRunnerConfig = (overrides: Record<string, unknown>) =>
   renderedConfig({ runner_configs: [{ ...linux, ...overrides }] })
+const parsedWith = (overrides: Record<string, unknown>) =>
+  testConfig({ runner_configs: [{ ...linux, ...overrides }] })
 
 const SECRET_ARN = 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:remote-write-AbCdEf'
 const AMP = 'https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-1/api/v1/remote_write'
@@ -45,7 +47,7 @@ const assertProblems = (config: unknown, expected: readonly RegExp[]) => {
 
 describe('parseConfig', () => {
   it('reads the config the module renders', () => {
-    const config = parseConfig(JSON.stringify(withRunnerConfig({})))
+    const config = parsedWith({})
     const [first] = config.runnerConfigs
     assert.equal(first?.environment, 'ci-linux')
     assert.equal(first?.maxRunners, 64)
@@ -65,30 +67,35 @@ describe('parseConfig', () => {
   })
 
   it("requires every field the module renders: the defaults are the module's alone", () => {
-    assertProblems(
-      renderedConfig({
-        runner_configs: [{ ...linux, github_api_url: undefined, max_runners: undefined }],
-        remote_write: { timeout_seconds: undefined },
-        boot_grace_seconds: undefined,
-      }),
-      [
-        /github_api_url must be an http\(s\) URL/,
-        /max_runners must be a number/,
-        /remote_write\.timeout_seconds must be a number/,
-        /boot_grace_seconds must be a number/,
-      ],
-    )
+    const sigv4 = (auth: Record<string, unknown>) =>
+      renderedConfig({ remote_write: { url: AMP, auth: { ...SIGV4, ...auth } } })
+    const missing: [unknown, RegExp][] = [
+      [withRunnerConfig({ max_runners: undefined }), /max_runners must be a number/],
+      [withRunnerConfig({ runner_name_prefix: undefined }), /runner_name_prefix must be a string/],
+      [withRunnerConfig({ github_api_url: undefined }), /github_api_url must be an http\(s\) URL/],
+      [withRunnerConfig({ labels: undefined }), /runner_configs\[0\]\.labels must be an object/],
+      [{ ...renderedConfig(), github: undefined }, /^github must be an object/],
+      [renderedConfig({ github: { credentials: undefined } }), /github\.credentials must be an/],
+      [renderedConfig({ github: { owners: undefined } }), /github\.owners must be an array/],
+      [renderedConfig({ remote_write: { auth: undefined } }), /remote_write\.auth must be an/],
+      [renderedConfig({ remote_write: { headers: undefined } }), /headers must be an object/],
+      [renderedConfig({ remote_write: { timeout_seconds: undefined } }), /timeout_seconds must be/],
+      [sigv4({ region: undefined }), /auth\.region must be a non-empty string/],
+      [sigv4({ service: undefined }), /auth\.service must be a non-empty string/],
+      [sigv4({ session_name: undefined }), /auth\.session_name must be a non-empty string/],
+      [{ ...renderedConfig(), labels: undefined }, /^labels must be an object/],
+      [{ ...renderedConfig(), boot_grace_seconds: undefined }, /^boot_grace_seconds must be/],
+      [{ ...renderedConfig(), source_timeout_seconds: undefined }, /^source_timeout_seconds must/],
+    ]
+    for (const [config, problem] of missing) assertProblems(config, [problem])
   })
 
   it('treats -1 as an unlimited runner cap', () => {
-    const config = parseConfig(JSON.stringify(withRunnerConfig({ max_runners: -1 })))
-    assert.equal(config.runnerConfigs[0]?.maxRunners, null)
+    assert.equal(parsedWith({ max_runners: -1 }).runnerConfigs[0]?.maxRunners, null)
   })
 
   it('takes each queue kind from the config, whatever the queue is called', () => {
-    const config = parseConfig(
-      JSON.stringify(withRunnerConfig({ queues: queuesOf('jobs.fifo', 'jobs-failed.fifo') })),
-    )
+    const config = parsedWith({ queues: queuesOf('jobs.fifo', 'jobs-failed.fifo') })
     assert.deepEqual(
       config.runnerConfigs[0]?.queues.map(q => [q.kind, q.name]),
       [
@@ -96,7 +103,7 @@ describe('parseConfig', () => {
         ['dead_letter', 'jobs-failed.fifo'],
       ],
     )
-    const mainOnly = parseConfig(JSON.stringify(withRunnerConfig({ queues: queuesOf('jobs') })))
+    const mainOnly = parsedWith({ queues: queuesOf('jobs') })
     assert.deepEqual(
       mainOnly.runnerConfigs[0]?.queues.map(q => q.kind),
       ['main'],
@@ -110,29 +117,21 @@ describe('parseConfig', () => {
   })
 
   it('reads the GitHub and SigV4 options', () => {
-    const config = parseConfig(
-      JSON.stringify(
-        renderedConfig({
-          github: {
-            credentials: {
-              type: 'secret',
-              secret_arn:
-                'arn:aws:secretsmanager:eu-west-1:123456789012:secret:runner-metrics/github-app-AbCdEf',
-            },
-            owners: ['acme', 'acme/widgets'],
-          },
-          remote_write: {
-            url: AMP,
-            auth: {
-              ...SIGV4,
-              role_arn: 'arn:aws:iam::210987654321:role/writer',
-              external_id: 'ci',
-            },
-            headers: { 'X-Scope-OrgID': 'ci' },
-          },
-        }),
-      ),
-    )
+    const config = testConfig({
+      github: {
+        credentials: {
+          type: 'secret',
+          secret_arn:
+            'arn:aws:secretsmanager:eu-west-1:123456789012:secret:runner-metrics/github-app-AbCdEf',
+        },
+        owners: ['acme', 'acme/widgets'],
+      },
+      remote_write: {
+        url: AMP,
+        auth: { ...SIGV4, role_arn: 'arn:aws:iam::210987654321:role/writer', external_id: 'ci' },
+        headers: { 'X-Scope-OrgID': 'ci' },
+      },
+    })
     assert.equal(config.github.credentials.type, 'secret')
     assert.deepEqual(config.github.owners, ['acme', 'acme/widgets'])
     assert.deepEqual(config.remoteWrite.auth, {
@@ -148,27 +147,17 @@ describe('parseConfig', () => {
 
   it('reads basic and bearer auth, and SSM credentials', () => {
     for (const type of ['basic', 'bearer'] as const) {
-      const config = parseConfig(
-        JSON.stringify(
-          renderedConfig({ remote_write: { url: AMP, auth: { type, secret_arn: SECRET_ARN } } }),
-        ),
-      )
+      const config = testConfig({
+        remote_write: { url: AMP, auth: { type, secret_arn: SECRET_ARN } },
+      })
       assert.deepEqual(config.remoteWrite.auth, { type, secretArn: SECRET_ARN })
     }
-    const ssm = parseConfig(
-      JSON.stringify(
-        renderedConfig({
-          github: {
-            credentials: {
-              type: 'ssm',
-              app_id_parameter: '/gh/id',
-              private_key_parameter: '/gh/key',
-            },
-            owners: ['acme'],
-          },
-        }),
-      ),
-    )
+    const ssm = testConfig({
+      github: {
+        credentials: { type: 'ssm', app_id_parameter: '/gh/id', private_key_parameter: '/gh/key' },
+        owners: ['acme'],
+      },
+    })
     assert.deepEqual(ssm.github.credentials, {
       type: 'ssm',
       appIdParameter: '/gh/id',
@@ -284,9 +273,7 @@ describe('parseConfig', () => {
       secret_arn: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-app-AbCdEf',
     }
     assertProblems(renderedConfig({ github: { credentials } }), [/github\.owners must list/])
-    const config = parseConfig(
-      JSON.stringify(renderedConfig({ github: { credentials, owners: ['Acme', 'Acme/Widgets'] } })),
-    )
+    const config = testConfig({ github: { credentials, owners: ['Acme', 'Acme/Widgets'] } })
     assert.deepEqual(config.github.owners, ['acme', 'acme/widgets'])
   })
 

@@ -36,7 +36,7 @@ data "aws_iam_policy_document" "lambda" {
   lifecycle {
     precondition {
       condition     = length(local.rejected.queue_arns) == 0
-      error_message = "Queues must be SQS queue ARNs, without wildcards (a derived name is <environment>-queued-builds_dead_letter, at most 80 characters): ${join(", ", local.rejected.queue_arns)}."
+      error_message = "Every runner config needs a main queue, and its queues must be SQS queue ARNs without wildcards (a derived main queue is <environment>-queued-builds, at most 80 characters): ${join(", ", local.rejected.queue_arns)}."
     }
     precondition {
       condition     = length(local.rejected.ssm_parameter_names) == 0

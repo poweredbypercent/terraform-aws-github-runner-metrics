@@ -2,8 +2,10 @@
 # the Lambda, which permissions it grants, and what it refuses. Needs Terraform >= 1.7 (mocks);
 # the one run that needs 1.11 is in created_secret.tftest.hcl.
 #
-# A refusal names the rules that refused it: local.rejected lists each rule's offenders
-# (validation.tf), and Terraform evaluates a run's assertions even when its expected failures occur.
+# A refusal names the rules that refused it: local.refused holds each rule that did, with its
+# offenders (validation.tf), and Terraform evaluates a run's assertions even when its expected
+# failures occur. A variable's own validations can only be named by their variable, so each of
+# those runs breaks one of them alone.
 
 mock_provider "aws" {
   override_data {
@@ -71,10 +73,6 @@ run "renders_the_configuration_the_lambda_reads" {
   assert {
     condition     = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG) == jsondecode(file("src/test/config.v1.secret-sigv4.json"))
     error_message = "CONFIG differs from src/test/config.v1.secret-sigv4.json, which the Lambda's contract test parses. It is now: ${aws_lambda_function.this.environment[0].variables.CONFIG}"
-  }
-  assert {
-    condition     = alltrue([for offenders in values(local.rejected) : length(offenders) == 0])
-    error_message = "nothing is refused: ${jsonencode(local.rejected)}"
   }
 }
 
@@ -149,6 +147,24 @@ run "renders_a_root_module_stack_and_bearer_auth" {
       for s in data.aws_iam_policy_document.lambda.statement : s.resources if contains(s.actions, "secretsmanager:GetSecretValue")
     ])) == jsonencode(["arn:aws:secretsmanager:eu-west-1:123456789012:secret:mimir-AbCdEf"])
     error_message = "the role can read the remote-write token, and no other secret"
+  }
+}
+
+run "renders_an_unauthenticated_receiver" {
+  command = plan
+
+  variables {
+    runner_configs = { ci = { environment = "ci", max_runners = 5, labels = { pool = "general" } } }
+    remote_write   = { url = "http://mimir.monitoring.svc:9009/api/v1/push", headers = { "X-Scope-OrgID" = "ci" } }
+  }
+
+  assert {
+    condition     = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG) == jsondecode(file("src/test/config.v1.unauthenticated.json"))
+    error_message = "CONFIG differs from src/test/config.v1.unauthenticated.json, which the Lambda's contract test parses. It is now: ${aws_lambda_function.this.environment[0].variables.CONFIG}"
+  }
+  assert {
+    condition     = !contains(flatten([for s in data.aws_iam_policy_document.lambda.statement : s.actions]), "secretsmanager:GetSecretValue")
+    error_message = "nothing to authenticate with, so no secret to read"
   }
 }
 
@@ -439,8 +455,8 @@ run "rejects_no_runner_configs" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = length(local.runner_configs) == 0 && alltrue([for offenders in values(local.rejected) : length(offenders) == 0])
-    error_message = "only the missing runner configs are refused: ${jsonencode(local.rejected)}"
+    condition     = length(local.runner_configs) == 0 && length(local.refused) == 0
+    error_message = "only the missing runner configs are refused: ${jsonencode(local.refused)}"
   }
 }
 
@@ -455,8 +471,8 @@ run "rejects_a_runner_config_name_in_two_stacks" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ duplicate_names = ["linux"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ duplicate_names = ["linux"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -468,8 +484,8 @@ run "rejects_a_multi_runner_key_that_cannot_be_a_label" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ names = ["linux arm"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ names = ["linux arm"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -482,8 +498,8 @@ run "rejects_one_environment_sampled_twice" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ duplicate_environments = ["ci-linux"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ duplicate_environments = ["ci-linux"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -495,8 +511,8 @@ run "rejects_a_stack_without_an_environment" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ environments = ["linux"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ environments = ["linux"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -510,8 +526,8 @@ run "rejects_a_plain_http_github_from_a_stack" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ github_api_urls = ["linux"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ github_api_urls = ["linux"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -523,8 +539,8 @@ run "rejects_a_runner_cap_out_of_range" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ runner_caps = ["ci"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ runner_caps = ["ci"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -536,8 +552,8 @@ run "rejects_a_runner_cap_out_of_range_from_a_stack" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ runner_caps = ["linux"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ runner_caps = ["linux"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -549,8 +565,8 @@ run "rejects_a_built_in_label_on_a_runner_config" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ labels = ["environment"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ labels = ["environment"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -563,8 +579,21 @@ run "rejects_an_empty_label_value" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ labels = ["team"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ labels = ["team"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
+  }
+}
+
+run "rejects_a_null_label_value" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci", labels = { team = null } } }
+  }
+  expect_failures = [aws_lambda_function.this]
+
+  assert {
+    condition     = jsonencode(local.refused) == jsonencode({ labels = ["team"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -577,8 +606,8 @@ run "rejects_when_the_runner_module_app_cannot_be_found" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ ssm_parameters = ["app_id", "private_key"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ missing_ssm_parameters = ["app_id", "private_key"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -591,8 +620,8 @@ run "rejects_a_timeout_that_cannot_fit_a_slow_sample" {
   expect_failures = [aws_lambda_function.this]
 
   assert {
-    condition     = alltrue([for offenders in values(local.rejected) : length(offenders) == 0])
-    error_message = "only the timeout is refused: ${jsonencode(local.rejected)}"
+    condition     = length(local.refused) == 0
+    error_message = "only the timeout is refused: ${jsonencode(local.refused)}"
   }
 }
 
@@ -604,22 +633,60 @@ run "rejects_a_wildcard_queue" {
   expect_failures = [data.aws_iam_policy_document.lambda]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ queue_arns = ["arn:aws:sqs:eu-west-1:123456789012:*"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ queue_arns = ["ci main: arn:aws:sqs:eu-west-1:123456789012:*"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
-run "rejects_an_environment_too_long_for_its_queue_names" {
+run "rejects_a_missing_main_queue" {
   command = plan
   variables {
-    # 55 characters: its dead-letter queue's name would be 81, and SQS allows 80.
-    runner_configs = { ci = { environment = "e123456789012345678901234567890123456789012345678901234" } }
+    runner_configs = { ci = { environment = "ci", queues = { main = "" } } }
   }
   expect_failures = [data.aws_iam_policy_document.lambda]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ queue_arns = ["arn:aws:sqs:eu-west-1:123456789012:e123456789012345678901234567890123456789012345678901234-queued-builds_dead_letter"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ queue_arns = ["ci main: none"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
+  }
+}
+
+run "reads_an_empty_dead_letter_queue_as_none" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci", queues = { main = "arn:aws:sqs:eu-west-1:123456789012:ci-builds", dead_letter = "" } } }
+  }
+
+  assert {
+    condition     = jsondecode(aws_lambda_function.this.environment[0].variables.CONFIG).runner_configs[0].queues.dead_letter == null
+    error_message = "an empty dead_letter is no dead-letter queue, not one the Lambda cannot read"
+  }
+}
+
+run "leaves_out_a_dead_letter_queue_whose_name_could_not_exist" {
+  command = plan
+  variables {
+    # 60 characters: the main queue's name is 74, a dead-letter queue's would be 86 (SQS allows 80).
+    runner_configs = { ci = { environment = "e77777777777777777777777777777777777777777777777777777777777" } }
+  }
+
+  assert {
+    condition     = output.runner_configs.ci.queues.dead_letter == null
+    error_message = "no dead-letter queue the runner module could not have created"
+  }
+}
+
+run "rejects_an_environment_too_long_for_its_queue_name" {
+  command = plan
+  variables {
+    # 67 characters: its main queue's name would be 81, and SQS allows 80.
+    runner_configs = { ci = { environment = "e777777777777777777777777777777777777777777777777777777777777777777" } }
+  }
+  expect_failures = [data.aws_iam_policy_document.lambda]
+
+  assert {
+    condition     = jsonencode(local.refused) == jsonencode({ queue_arns = ["ci main: arn:aws:sqs:eu-west-1:123456789012:e777777777777777777777777777777777777777777777777777777777777777777-queued-builds"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -635,8 +702,8 @@ run "rejects_a_wildcard_ssm_parameter_from_a_stack" {
   expect_failures = [data.aws_iam_policy_document.lambda]
 
   assert {
-    condition     = jsonencode({ for rule, offenders in local.rejected : rule => offenders if length(offenders) > 0 }) == jsonencode({ ssm_parameter_names = ["/gh/*"] })
-    error_message = "refused by: ${jsonencode(local.rejected)}"
+    condition     = jsonencode(local.refused) == jsonencode({ ssm_parameter_names = ["/gh/*"] })
+    error_message = "refused by: ${jsonencode(local.refused)}"
   }
 }
 
@@ -803,6 +870,102 @@ run "rejects_a_wildcard_kms_key" {
     secrets_kms_key_arns = ["arn:aws:kms:eu-west-1:123456789012:key/*"]
   }
   expect_failures = [var.secrets_kms_key_arns]
+}
+
+run "rejects_a_wildcard_log_and_environment_key" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    kms_key_arn    = "arn:aws:kms:eu-west-1:123456789012:key/*"
+  }
+  expect_failures = [var.kms_key_arn]
+}
+
+run "rejects_a_wildcard_remote_write_secret" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write = {
+      url  = "https://prometheus.example/api/v1/write"
+      auth = { basic = { secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:*" } }
+    }
+  }
+  expect_failures = [var.remote_write]
+}
+
+run "requires_a_sigv4_region_off_aws_hostnames" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write   = { url = "https://prometheus.example/api/v1/write", auth = { sigv4 = {} } }
+  }
+  expect_failures = [var.remote_write]
+}
+
+run "rejects_an_external_id_without_a_role" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write = {
+      url  = "https://aps-workspaces.eu-west-1.amazonaws.com/workspaces/ws-1/api/v1/remote_write"
+      auth = { sigv4 = { external_id = "metrics" } }
+    }
+  }
+  expect_failures = [var.remote_write]
+}
+
+run "rejects_a_control_character_in_a_header_value" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write   = { url = "https://prometheus.example/api/v1/write", headers = { "X-Scope-OrgID" = "ci\r\nX-Injected: 1" } }
+  }
+  expect_failures = [var.remote_write]
+}
+
+run "rejects_a_push_budget_out_of_range" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    remote_write   = { url = "https://prometheus.example/api/v1/write", timeout_seconds = 61 }
+  }
+  expect_failures = [var.remote_write]
+}
+
+run "rejects_a_source_budget_out_of_range" {
+  command = plan
+  variables {
+    runner_configs         = { ci = { environment = "ci" } }
+    source_timeout_seconds = 0
+  }
+  expect_failures = [var.source_timeout_seconds]
+}
+
+run "rejects_a_boot_grace_out_of_range" {
+  command = plan
+  variables {
+    runner_configs     = { ci = { environment = "ci" } }
+    boot_grace_seconds = 3601
+  }
+  expect_failures = [var.boot_grace_seconds]
+}
+
+run "rejects_a_github_server_url_with_a_path" {
+  command = plan
+  variables {
+    runner_configs               = { ci = { environment = "ci" } }
+    github_enterprise_server_url = "https://github.example.com/api/v3"
+  }
+  expect_failures = [var.github_enterprise_server_url]
+}
+
+run "rejects_an_owner_github_would_not_name" {
+  command = plan
+  variables {
+    runner_configs = { ci = { environment = "ci" } }
+    github_app     = { source = "existing_secret", secret_arn = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:github-app-AbCdEf", owners = ["acme/*"] }
+  }
+  expect_failures = [var.github_app]
 }
 
 run "requires_an_owners_allowlist_with_github" {

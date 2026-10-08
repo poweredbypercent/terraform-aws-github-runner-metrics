@@ -71,10 +71,17 @@ locals {
       )
       # The runner module names a config's queues "<environment>-queued-builds" and, with
       # redrive_build_queue, "<environment>-queued-builds_dead_letter". The dead-letter queue is
-      # always listed: the Lambda treats one that does not exist as absent, not as a failure.
-      queues = c.queues != null ? c.queues : {
-        main        = "${local.sqs_arn_prefix}:${coalesce(c.environment, "unknown")}-queued-builds"
-        dead_letter = "${local.sqs_arn_prefix}:${coalesce(c.environment, "unknown")}-queued-builds_dead_letter"
+      # listed whenever a queue of that name could exist (SQS allows 80 characters): the Lambda
+      # treats one that does not exist as absent, not as a failure. An empty one given is none.
+      queues = c.queues != null ? {
+        main        = c.queues.main
+        dead_letter = c.queues.dead_letter == "" ? null : c.queues.dead_letter
+        } : {
+        main = "${local.sqs_arn_prefix}:${coalesce(c.environment, "unknown")}-queued-builds"
+        dead_letter = (
+          length("${coalesce(c.environment, "unknown")}-queued-builds_dead_letter") > 80 ? null :
+          "${local.sqs_arn_prefix}:${coalesce(c.environment, "unknown")}-queued-builds_dead_letter"
+        )
       }
       labels = c.labels
     }...

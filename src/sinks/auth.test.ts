@@ -76,8 +76,26 @@ describe('refreshingCredentials', () => {
     await provider()
     assert.equal(calls, 1, 'still more than five minutes to go')
     now = 11 * 60_000
-    await provider()
+    assert.equal(await provider(), a, 'four minutes left: signs while the refresh runs')
     assert.equal(calls, 2)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.notEqual(await provider(), a, 'then the refreshed ones')
+    assert.equal(calls, 2)
+  })
+
+  it('keeps signing while a refresh hangs, and replaces the hung one', async () => {
+    let now = 0
+    let calls = 0
+    const provider = refreshingCredentials(
+      async () => (calls++ === 0 ? issued(now + 15 * 60_000) : new Promise<never>(() => {})),
+      () => now,
+    )
+    const first = await provider()
+    now = 11 * 60_000
+    assert.equal(await provider(), first)
+    now = 11 * 60_000 + 31_000
+    assert.equal(await provider(), first)
+    assert.equal(calls, 3, 'the hung refresh was replaced')
   })
 
   it('keeps credentials that do not expire, and tries again after a failure', async () => {
@@ -133,8 +151,9 @@ describe('refreshingCredentials', () => {
     fail = true
     now = 12 * 60_000
     assert.equal(await provider(), first, 'three minutes left: still signs')
+    await new Promise(resolve => setImmediate(resolve))
     now = 15 * 60_000
-    await assert.rejects(provider(), /sts down/)
+    await assert.rejects(provider(), /sts down/, "expired: the failure is the caller's")
   })
 })
 

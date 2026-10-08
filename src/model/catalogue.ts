@@ -73,7 +73,7 @@ export const METRICS = {
   ),
   queueAge: define(
     'scale_up_queue_oldest_message_age_seconds',
-    'Age of the oldest message in the queue (CloudWatch ApproximateAgeOfOldestMessage, about a minute behind; 0 as soon as SQS finds the queue empty). Grows while depth stays flat when scale-up keeps failing.',
+    'Age of the oldest message in the queue (CloudWatch ApproximateAgeOfOldestMessage, about a minute behind; 0 as soon as SQS finds the queue empty). Left out while it is unknown: CloudWatch has no datapoint yet for a queue holding messages, or the queue does not exist. Grows while depth stays flat when scale-up keeps failing.',
     [...CONFIG, 'queue'],
     'cloudwatch',
   ),

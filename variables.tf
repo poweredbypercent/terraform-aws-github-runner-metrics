@@ -54,7 +54,7 @@ variable "runner_configs" {
     built-in label, non-empty values).
 
     These rules hold for runner configs read from runner_stacks too, so they are checked once, on
-    both, at plan.
+    both, at plan (or at apply, for values only known then).
   EOT
   type = map(object({
     environment        = string
@@ -165,7 +165,7 @@ variable "github_app" {
 }
 
 variable "github_enterprise_server_url" {
-  description = "GitHub Enterprise Server base URL (e.g. https://github.example.com) for every stack, overriding what the runner stacks say. null: from each stack, else github.com."
+  description = "GitHub Enterprise Server base URL (e.g. https://github.example.com) for every stack, overriding what the runner stacks say; the GitHub App's tokens are sent there, so set it to pin that when others maintain the stacks. null: from each stack, else github.com."
   type        = string
   default     = null
 
@@ -184,7 +184,8 @@ variable "remote_write" {
     The Prometheus remote_write endpoint, and how to authenticate to it.
 
     url: the endpoint itself (a redirect is not followed), http or https, without credentials, a
-    query string or a fragment. https whenever auth is set.
+    query string or a fragment. https whenever auth is set. The host is a name or an IPv4 address
+    (a non-ASCII name in its xn-- form); IPv6 literals are not accepted.
 
     auth, at most one of:
 

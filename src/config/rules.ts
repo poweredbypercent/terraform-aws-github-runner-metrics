@@ -1,9 +1,10 @@
 /**
- * What CONFIG values must look like, as regular expression sources. The Terraform module refuses
- * the same values before it deploys, with these patterns written out in its own files
- * (variables.tf, validation.tf), and parity.test.ts finds each one there: the module cannot accept
- * a value the Lambda would reject on every invocation. They use only the syntax Terraform's RE2 and
- * JavaScript share: no \d, \w or \s, and no inline flags.
+ * What CONFIG values must be: their patterns, as regular expression sources, their numeric limits
+ * and the headers no one may set. The Terraform module refuses the same values before it deploys,
+ * with these rules written out in its own files (variables.tf, validation.tf), and parity.test.ts
+ * holds the two copies to each other: the module cannot accept a value the Lambda would reject on
+ * every invocation. The patterns use only the syntax Terraform's RE2 and JavaScript share: no \d,
+ * \w or \s, and no inline flags. Label names are the domain's (src/domain/labels.ts).
  */
 export const PATTERNS = {
   /** A runner config's name: its runner_config label. */
@@ -27,11 +28,22 @@ export const PATTERNS = {
   headerValue: '^[ -~]+$',
   /** A SigV4 signing region or service. */
   awsName: '^[a-z0-9-]+$',
-  /** The characters STS allows in an external id; its length, 2-1224, is checked apart. */
+  /** The characters STS allows in an external id; its length is a limit below. */
   externalId: '^[A-Za-z0-9_+=,./:@-]+$',
 } as const
 
-/** Headers the remote-write client sets itself; SigV4's own (x-amz-*) are the signer's. */
+/** Inclusive bounds. */
+export const LIMITS = {
+  /** A runner config's runner cap; -1, unlimited, is apart. */
+  maxRunners: { min: 0, max: 100_000 },
+  /** The push's budget, and each source's. */
+  timeoutSeconds: { min: 1, max: 60 },
+  bootGraceSeconds: { min: 0, max: 3600 },
+  /** STS's bounds on an external id. */
+  externalIdLength: { min: 2, max: 1224 },
+} as const
+
+/** Headers the remote-write client sets itself. */
 export const RESERVED_HEADERS: readonly string[] = [
   'authorization',
   'content-encoding',
@@ -41,3 +53,5 @@ export const RESERVED_HEADERS: readonly string[] = [
   'user-agent',
   'x-prometheus-remote-write-version',
 ]
+/** SigV4's own headers (x-amz-date, x-amz-security-token, ...) are the signer's to set. */
+export const RESERVED_HEADER_PREFIX = 'x-amz-'

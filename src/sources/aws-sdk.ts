@@ -122,18 +122,24 @@ export const cloudWatchQueueAges =
     return datapoints
   }
 
-const toEc2Instance = (i: Instance & { InstanceId: string }): Ec2Instance => ({
-  id: i.InstanceId,
-  type: i.InstanceType,
-  lifecycle: i.InstanceLifecycle,
-  state: i.State?.Name,
-  launchTime: i.LaunchTime,
-  tags: Object.fromEntries(
-    (i.Tags ?? []).flatMap(t =>
-      t.Key === undefined || t.Value === undefined ? [] : [[t.Key, t.Value]],
-    ),
-  ),
-})
+/** An instance in plain terms; one without an id is no runner to count. */
+const toEc2Instance = (i: Instance): Ec2Instance[] =>
+  i.InstanceId === undefined
+    ? []
+    : [
+        {
+          id: i.InstanceId,
+          type: i.InstanceType,
+          lifecycle: i.InstanceLifecycle,
+          state: i.State?.Name,
+          launchTime: i.LaunchTime,
+          tags: Object.fromEntries(
+            (i.Tags ?? []).flatMap(t =>
+              t.Key === undefined || t.Value === undefined ? [] : [[t.Key, t.Value]],
+            ),
+          ),
+        },
+      ]
 
 export const ec2RunnerInstances =
   (ec2: Send<DescribeInstancesCommand, DescribeInstancesCommandOutput>): DescribeRunnerInstances =>
@@ -153,10 +159,7 @@ export const ec2RunnerInstances =
         { abortSignal },
       )
       for (const reservation of page.Reservations ?? []) {
-        for (const instance of reservation.Instances ?? []) {
-          if (instance.InstanceId !== undefined)
-            instances.push(toEc2Instance({ ...instance, InstanceId: instance.InstanceId }))
-        }
+        instances.push(...(reservation.Instances ?? []).flatMap(toEc2Instance))
       }
       NextToken = page.NextToken
     } while (NextToken)
